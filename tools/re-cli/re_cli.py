@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
@@ -16,10 +17,20 @@ import time
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_REPO = HERE / 'backend' if (HERE / 'backend').is_dir() else HERE.parents[1]
-VERSION = '0.1.0'
+VERSION = '0.1.1'
 CHILDREN = set()
 CHILD_LOCK = threading.Lock()
 STOP = threading.Event()
+PRINT_LOCK = threading.Lock()
+
+
+def emit(message):
+    # Binary-provided names/logs must not inject terminal control sequences.
+    message = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', str(message))
+    message = ''.join(ch if ch == '\t' or (ch.isprintable() and ch not in '\r\n')
+                      else '?' for ch in message)
+    with PRINT_LOCK:
+        print(message, flush=True)
 
 
 def save(path, value):
@@ -48,7 +59,9 @@ def stop_children():
                 pass
 
 
-def run(command, folder, timeout, memory, cpu=None, env=None, marker=False, cwd=HERE):
+def run(command, folder, timeout, memory, cpu=None, env=None, marker=False, cwd=HERE, label=None):
+    label = label or folder.name
+    emit(f'[{label}] started')
     folder.mkdir(parents=True, exist_ok=True)
     mark = folder / 'sandbox-active.json'
     mark.unlink(missing_ok=True)
@@ -60,10 +73,19 @@ def run(command, folder, timeout, memory, cpu=None, env=None, marker=False, cwd=
         with CHILD_LOCK:
             if STOP.is_set():
                 return dict(status='interrupted')
-            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       text=True, encoding='utf-8', errors='replace',
                                        env=env or {'PATH': '/usr/bin:/bin', 'LANG': 'C'},
                                        cwd=cwd, start_new_session=True)
             CHILDREN.add(process)
+        def relay():
+            with process.stdout:
+                for line in process.stdout:
+                    log.write(line)
+                    log.flush()
+                    emit(f'[{label}] {line.rstrip()}')
+        reader = threading.Thread(target=relay, daemon=True)
+        reader.start()
         try:
             code = process.wait(timeout=timeout)
             status = 'ok' if code == 0 else 'failed'
@@ -71,14 +93,24 @@ def run(command, folder, timeout, memory, cpu=None, env=None, marker=False, cwd=
             os.killpg(process.pid, signal.SIGKILL)
             code = process.wait()
             status = 'timeout'
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise
         finally:
             with CHILD_LOCK:
                 CHILDREN.discard(process)
+            reader.join()
     if STOP.is_set():
         status = 'interrupted'
     elif marker and not mark.exists():
         status = 'sandbox_failed'
-    return dict(status=status, exit_code=code, seconds=round(time.monotonic() - start, 3),
+    elapsed = round(time.monotonic() - start, 3)
+    emit(f'[{label}] {status}; exit={code}; {elapsed:.3f}s; log: {folder / "analysis.log"}')
+    return dict(status=status, exit_code=code, seconds=elapsed,
                 log=str(folder / 'analysis.log'))
 
 
@@ -160,14 +192,15 @@ class Workflow:
         # in a dedicated working directory also works when output has spaces.
         shutil.copyfile(self.tools['analysis-lockdown.so'], self.runtime / 'analysis-lockdown.so')
 
-    def restricted(self, command, source, folder, timeout=None):
+    def restricted(self, command, source, folder, timeout=None, label=None):
         env = dict(PATH='/usr/bin:/bin', LANG='C', LD_PRELOAD='./analysis-lockdown.so',
                    ANALYSIS_INPUT=str(source), ANALYSIS_SPEC=str(self.specs),
                    ANALYSIS_OUTPUT=str(folder), ANALYSIS_MARKER=str(folder / 'sandbox-active.json'))
         # Apply LD_PRELOAD to the analyzer, after prlimit (not to prlimit itself).
         command = ['/usr/bin/env', '-i', *(f'{k}={v}' for k, v in env.items()), *map(str, command)]
         return run(command, folder, timeout or self.args.function_timeout, self.args.memory_mb,
-                   cpu=self.args.cpu_seconds if timeout is None else None, marker=True, cwd=self.runtime)
+                   cpu=self.args.cpu_seconds if timeout is None else None, marker=True, cwd=self.runtime,
+                   label=label)
 
     def analyze(self, source):
         sha = digest(source)
@@ -182,7 +215,7 @@ class Workflow:
         folder = folder / fingerprint[:16]
         folder.mkdir(parents=True, exist_ok=True)
         result = dict(path=str(source), sha256=sha, output=str(folder), target_executed=False)
-        print(f'[binary] {source}', flush=True)
+        emit(f'[binary] {source}')
         inv = folder / 'inventory'
         check = run([sys.executable, HERE / 'inventory.py', source, inv,
                      self.tools['analysis-lockdown.so']], inv, self.args.stage_timeout, self.args.memory_mb)
@@ -219,20 +252,24 @@ class Workflow:
                 if (row.get('fingerprint') == fingerprint and row.get('status') == 'ok'
                         and (out / 'decompiled.c').is_file()):
                     row['resumed'] = True
+                    emit(f'[function {item["name"]} @ 0x{item["address"]:x}] resumed successful result')
                     return row
             row = dict(**item, fingerprint=fingerprint)
             (out / 'decompiled.c').unlink(missing_ok=True)
             row['decompile'] = self.restricted([self.tools['core-decompile'], source, self.specs,
-                                                item['name'], out], source, out)
+                                                item['name'], out], source, out,
+                                                label=f'decompile {item["name"]} @ 0x{item["address"]:x}')
             row['status'] = row['decompile']['status']
             if row['status'] == 'ok' and not (out / 'decompiled.c').is_file():
                 row['status'] = 'missing_pseudocode'
             if self.args.symbolic:
                 symbolic = out / 'symbolic'
                 row['symbolic'] = self.restricted([self.tools['native-audit'], 'lift', source,
-                    self.specs / 'x86-64.sla', symbolic, item['name']], source, symbolic)
+                    self.specs / 'x86-64.sla', symbolic, item['name']], source, symbolic,
+                    label=f'symbolic {item["name"]} @ 0x{item["address"]:x}')
                 if row['symbolic']['status'] != 'ok':
                     row['status'] = 'partial'
+            emit(f'[function {item["name"]} @ 0x{item["address"]:x}] {row["status"]}')
             save(checkpoint, row)
             return row
 
@@ -244,8 +281,8 @@ class Workflow:
                 futures = [pool.submit(work, item) for item in tasks[offset:offset + self.args.jobs * 4]]
                 for future in as_completed(futures):
                     rows.append(future.result())
-                    if len(rows) % 16 == 0 or len(rows) == len(tasks):
-                        print(f'[functions] {len(rows)}/{len(tasks)}', flush=True)
+                    emit(f'[progress] {len(rows)}/{len(tasks)} functions; '
+                         f'{100 * len(rows) / len(tasks):.1f}%')
         except BaseException:
             stop_children()
             raise
@@ -270,8 +307,57 @@ class Workflow:
         return result
 
 
+def print_summary(report, elapsed):
+    binaries = report['binaries']
+    counts = dict(succeeded=0, failed=0, timed_out=0, partial=0, interrupted=0)
+    resumed = emitted = total = 0
+    stages = []
+    for binary in binaries:
+        rows = binary.get('functions', [])
+        total += len(rows)
+        resumed += sum(bool(row.get('resumed')) for row in rows)
+        emitted += binary.get('pseudocode_emitted', 0)
+        stages.extend(binary[name] for name in ('inventory', 'assembly', 'decoder', 'bun_extraction')
+                      if name in binary)
+        for row in rows:
+            stages.extend(row[name] for name in ('decompile', 'symbolic') if name in row)
+            decompile = row.get('decompile', {}).get('status', row['status'])
+            if decompile == 'timeout':
+                category = 'timed_out'
+            elif decompile == 'interrupted':
+                category = 'interrupted'
+            elif decompile != 'ok' or row['status'] == 'missing_pseudocode':
+                category = 'failed'
+            elif row['status'] == 'ok':
+                category = 'succeeded'
+            else:
+                category = 'partial'
+            counts[category] += 1
+        executable = binary.get('executable_bytes', 0)
+        named = binary.get('named_code_bytes', 0)
+        emit(f'[binary result] {binary["path"]}: {binary["status"]}; '
+             f'{binary.get("pseudocode_emitted", 0)}/{len(rows)} pseudocode files; '
+             f'named code {named}/{executable} bytes')
+    emit('=== Final summary ===')
+    emit(f'Binaries: {len(binaries)} total | '
+         f'{sum(b["status"] == "ok" for b in binaries)} succeeded | '
+         f'{sum(b["status"] == "partial" for b in binaries)} partial | '
+         f'{sum(b["status"] == "failed" for b in binaries)} failed')
+    emit(f'Functions: {total} total | {counts["succeeded"]} succeeded | '
+         f'{counts["failed"]} failed | {counts["timed_out"]} timed out | '
+         f'{counts["partial"]} partial | {counts["interrupted"]} interrupted')
+    emit(f'Analysis stages: {sum(s["status"] == "ok" for s in stages)} succeeded | '
+         f'{sum(s["status"] not in ("ok", "timeout", "interrupted") for s in stages)} failed | '
+         f'{sum(s["status"] == "timeout" for s in stages)} timed out | '
+         f'{sum(s["status"] == "interrupted" for s in stages)} interrupted')
+    emit(f'Pseudocode files: {emitted} | Resumed functions: {resumed} | '
+         f'Skipped files/directories: {len(report["skipped"])} | Elapsed: {elapsed:.2f}s')
+    emit('Function totals cover identified named functions; unsymbolized code is outside decompilation coverage.')
+
+
 def main(argv=None):
     STOP.clear()
+    started = time.monotonic()
     parser = argparse.ArgumentParser(prog='re-', description=__doc__,
         epilog='Example: re- /path/to/application folder\n'
                'Space-separated folder words are joined. Shell metacharacters still use normal shell escaping.\n'
@@ -321,18 +407,22 @@ def main(argv=None):
             report = dict(input=str(target), version=VERSION, binaries=[], skipped=skipped,
                           target_executed=False, whole_application_recovered=False, status='running')
             save(workflow.output / 'report.json', report)
-            print(f'[scan] {len(paths)} ELF files; {len(skipped)} skipped; results: {workflow.output}', flush=True)
+            emit(f'[scan] {len(paths)} ELF files; {len(skipped)} skipped; results: {workflow.output}')
+            for item in skipped:
+                emit(f'[skipped] {item["path"]}: {item["reason"]}')
             for source in paths:
                 try:
                     result = workflow.analyze(source)
                 except (OSError, ValueError) as error:
                     result = dict(path=str(source), status='failed', error=str(error))
+                    emit(f'[error] {source}: {error}')
                 report['binaries'].append(result)
                 save(workflow.output / 'report.json', report)
             report['status'] = 'partial' if (not paths or skipped or any(
                 row['status'] != 'ok' for row in report['binaries'])) else 'ok'
             save(workflow.output / 'report.json', report)
-            print(f'[{report["status"]}] Report: {workflow.output / "report.json"}', flush=True)
+            print_summary(report, time.monotonic() - started)
+            emit(f'[{report["status"]}] Report: {workflow.output / "report.json"}')
             return 0 if report['status'] == 'ok' else 2
     except KeyboardInterrupt:
         stop_children()

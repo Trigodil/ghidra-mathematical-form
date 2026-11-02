@@ -25,6 +25,12 @@ logs and a JSON report. Rerun the same command to reuse successful function
 checkpoints. `--fresh` retries them; `--symbolic` also attempts generic register
 and RAM models. `re- --help` lists resource limits and other options.
 
+The terminal streams analyzer output and errors live, labels each stage and
+function result, and prints progress after each function. Final totals include
+successful, failed, timed-out and partial functions, binary outcomes, analysis
+stage outcomes, emitted pseudocode files, resumed work, skipped paths and elapsed
+time. Full logs remain available in the result directory.
+
 The backend supports little-endian x86-64 ELF executables and shared libraries
 on Linux with Landlock ABI 3 or newer and seccomp. It decompiles named, sized
 functions. Stripped code still gets an assembly view, but complete source

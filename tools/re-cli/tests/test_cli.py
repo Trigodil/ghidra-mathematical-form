@@ -1,6 +1,8 @@
 """End-to-end checks against real compiled ELF inputs and the prepared backend."""
 import fcntl
+import contextlib
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -8,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +48,11 @@ class WorkflowTests(unittest.TestCase):
         args = [*str(self.app).split(' '), '--output', str(output)]
         run = self.invoke(*args)
         self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertIn('[inventory] started', run.stdout)
+        self.assertIn('[assembly] ok', run.stdout)
+        self.assertIn('[decompile add @', run.stdout)
+        self.assertIn('[progress]', run.stdout)
+        self.assertIn('=== Final summary ===', run.stdout)
         report = json.loads((output / 'report.json').read_text())
         self.assertEqual(len(report['binaries']), 2)
         self.assertFalse(report['target_executed'])
@@ -62,6 +70,8 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn('add(', source.read_text())
             marker = json.loads((source.parent / 'sandbox-active.json').read_text())
             self.assertTrue(marker['landlock'] and marker['seccomp'])
+        total = sum(len(binary['functions']) for binary in report['binaries'])
+        self.assertIn(f'Functions: {total} total | {total} succeeded | 0 failed', run.stdout)
         again = self.invoke(*args)
         self.assertEqual(again.returncode, 2, again.stderr)
         report = json.loads((output / 'report.json').read_text())
@@ -81,6 +91,10 @@ class WorkflowTests(unittest.TestCase):
         report = json.loads((output / 'report.json').read_text())
         self.assertEqual(report['binaries'][0]['status'], 'failed')
         self.assertEqual(len(report['skipped']), 2)
+        self.assertIn('Truncated ELF record', run.stdout)
+        self.assertIn('[inventory] failed; exit=1', run.stdout)
+        self.assertIn('[skipped]', run.stdout)
+        self.assertIn('Binaries: 1 total | 0 succeeded | 0 partial | 1 failed', run.stdout)
         empty = self.root / 'empty'
         empty.mkdir()
         self.assertEqual(self.invoke(empty, '-o', self.root / 'empty-output').returncode, 2)
@@ -132,6 +146,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(installed.returncode, 2, installed.stdout + installed.stderr)
         report = json.loads((output / 'report.json').read_text())['binaries'][0]
         self.assertGreater(report['pseudocode_emitted'], 0)
+        self.assertIn('=== Final summary ===', installed.stdout)
         # All native/spec inputs in provenance must come from the installed bundle.
         import importlib.util
         spec = importlib.util.spec_from_file_location('installed_cli', prefix / 'lib/re-cli/re_cli.py')
@@ -150,6 +165,55 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('unrelated command', run.stderr)
         self.assertEqual(command.read_text(), 'existing command')
         self.assertFalse((prefix / 'lib/re-cli').exists())
+
+    def test_analyzer_output_is_visible_before_process_exits(self):
+        seen = threading.Event()
+        class Capture(io.StringIO):
+            def write(self, text):
+                result = super().write(text)
+                if '[stream-test] first-line' in text:
+                    seen.set()
+                return result
+        release = self.root / 'release-stream-test'
+        command = [sys.executable, '-u', '-c',
+                   'import pathlib,sys,time; print("first-line",flush=True); '
+                   'print("stderr-error",file=sys.stderr,flush=True); '
+                   'p=pathlib.Path(sys.argv[1]); '
+                   'exec("while not p.exists(): time.sleep(0.01)"); print("last-line")',
+                   str(release)]
+        output = Capture()
+        results = []
+        with contextlib.redirect_stdout(output):
+            worker = threading.Thread(target=lambda: results.append(re_cli.run(
+                command, self.root / 'stream-test', 10, 128)))
+            worker.start()
+            try:
+                self.assertTrue(seen.wait(5), output.getvalue())
+                self.assertTrue(worker.is_alive(), 'Output was delayed until process exit')
+            finally:
+                release.touch()
+                worker.join(15)
+        self.assertEqual(results[0]['status'], 'ok')
+        self.assertIn('[stream-test] stderr-error', output.getvalue())
+        self.assertIn('[stream-test] last-line', output.getvalue())
+        self.assertIn('stderr-error', (self.root / 'stream-test/analysis.log').read_text())
+
+    def test_summary_distinguishes_failures_timeouts_and_symbolic_partial_results(self):
+        rows = [dict(status='ok', decompile=dict(status='ok'), resumed=True),
+                dict(status='failed', decompile=dict(status='failed')),
+                dict(status='timeout', decompile=dict(status='timeout')),
+                dict(status='partial', decompile=dict(status='ok'), symbolic=dict(status='timeout')),
+                dict(status='missing_pseudocode', decompile=dict(status='ok'))]
+        report = dict(binaries=[dict(path='fixture', status='partial', functions=rows,
+                                    pseudocode_emitted=2)], skipped=[dict(path='unsupported')])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            re_cli.print_summary(report, 1.25)
+        text = output.getvalue()
+        self.assertIn('Functions: 5 total | 1 succeeded | 2 failed | 1 timed out | 1 partial', text)
+        self.assertIn('Analysis stages: 3 succeeded | 1 failed | 2 timed out', text)
+        self.assertIn('Resumed functions: 1', text)
+        self.assertIn('Skipped files/directories: 1 | Elapsed: 1.25s', text)
 
 
 if __name__ == '__main__':
