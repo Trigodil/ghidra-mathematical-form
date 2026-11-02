@@ -26,7 +26,10 @@ checkpoints. `--fresh` retries them; `--symbolic` also attempts generic register
 and RAM models. `re- --help` lists resource limits and other options.
 
 The terminal streams analyzer output and errors live, labels each stage and
-function result, and prints progress after each function. Final totals include
+function result, and updates a progress bar after each function. In a terminal,
+the bar redraws below log messages; redirected output uses plain progress lines.
+The bar tracks completed named functions for the current binary, including
+resumed results, with success and issue counts. Final totals include
 successful, failed, timed-out and partial functions, binary outcomes, analysis
 stage outcomes, emitted pseudocode files, resumed work, skipped paths and elapsed
 time. Full logs remain available in the result directory.

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -52,6 +53,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('[assembly] ok', run.stdout)
         self.assertIn('[decompile add @', run.stdout)
         self.assertIn('[progress]', run.stdout)
+        self.assertIn('[progress] [', run.stdout)
+        self.assertIn('100.0%', run.stdout)
+        self.assertNotIn('\x1b', run.stdout)
         self.assertIn('=== Final summary ===', run.stdout)
         report = json.loads((output / 'report.json').read_text())
         self.assertEqual(len(report['binaries']), 2)
@@ -214,6 +218,35 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('Analysis stages: 3 succeeded | 1 failed | 2 timed out', text)
         self.assertIn('Resumed functions: 1', text)
         self.assertIn('Skipped files/directories: 1 | Elapsed: 1.25s', text)
+
+    def test_terminal_progress_preserves_errors_and_cleans_up_after_completion(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+        terminal = Terminal()
+        with contextlib.redirect_stdout(terminal), mock.patch.dict(os.environ, TERM='xterm'), \
+                mock.patch.object(shutil, 'get_terminal_size', return_value=os.terminal_size((100, 24))):
+            progress = re_cli.FunctionProgress(2)
+            progress.start()
+            try:
+                progress.update(dict(status='ok'))
+                re_cli.emit('[error] test failure')
+                progress.update(dict(status='failed'))
+            finally:
+                progress.close()
+            re_cli.emit('finished')
+        text = terminal.getvalue()
+        self.assertIn('1/2 functions; 50.0%', text)
+        self.assertIn('[error] test failure\n\r\x1b[2K[progress]', text)
+        self.assertIn('2/2 functions; 100.0% | ok: 1 | issues: 1', text)
+        self.assertTrue(text.endswith('\nfinished\n'))
+        self.assertIsNone(re_cli.ACTIVE_PROGRESS)
+
+    def test_narrow_terminal_progress_does_not_wrap(self):
+        progress = re_cli.FunctionProgress(100000)
+        progress.tty = True
+        with mock.patch.object(shutil, 'get_terminal_size', return_value=os.terminal_size((32, 24))):
+            self.assertLess(len(progress.line()), 32)
 
 
 if __name__ == '__main__':

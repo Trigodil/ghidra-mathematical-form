@@ -17,11 +17,61 @@ import time
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_REPO = HERE / 'backend' if (HERE / 'backend').is_dir() else HERE.parents[1]
-VERSION = '0.1.1'
+VERSION = '0.1.2'
 CHILDREN = set()
 CHILD_LOCK = threading.Lock()
 STOP = threading.Event()
 PRINT_LOCK = threading.Lock()
+ACTIVE_PROGRESS = None
+
+
+class FunctionProgress:
+    def __init__(self, total):
+        self.total = total
+        self.done = self.succeeded = self.issues = 0
+        self.tty = sys.stdout.isatty() and os.environ.get('TERM') != 'dumb'
+
+    def line(self):
+        columns = shutil.get_terminal_size(fallback=(100, 24)).columns
+        width = max(1, min(24, columns - 75))
+        fraction = self.done / self.total if self.total else 1
+        filled = int(width * fraction)
+        bar = '#' * filled + '-' * (width - filled)
+        text = (f'[progress] [{bar}] {self.done}/{self.total} functions; {100 * fraction:.1f}% '
+                f'| ok: {self.succeeded} | issues: {self.issues}')
+        return text[:max(1, columns - 1)] if self.tty else text
+
+    def draw(self):
+        sys.stdout.write('\r\x1b[2K' + self.line())
+        sys.stdout.flush()
+
+    def start(self):
+        global ACTIVE_PROGRESS
+        with PRINT_LOCK:
+            if self.tty:
+                ACTIVE_PROGRESS = self
+                self.draw()
+            else:
+                print(self.line(), flush=True)
+
+    def update(self, row):
+        with PRINT_LOCK:
+            self.done += 1
+            self.succeeded += row['status'] == 'ok'
+            self.issues += row['status'] != 'ok'
+            if self.tty:
+                self.draw()
+            else:
+                print(self.line(), flush=True)
+
+    def close(self):
+        global ACTIVE_PROGRESS
+        with PRINT_LOCK:
+            if ACTIVE_PROGRESS is self:
+                self.draw()
+                sys.stdout.write('\n')
+                sys.stdout.flush()
+                ACTIVE_PROGRESS = None
 
 
 def emit(message):
@@ -30,7 +80,11 @@ def emit(message):
     message = ''.join(ch if ch == '\t' or (ch.isprintable() and ch not in '\r\n')
                       else '?' for ch in message)
     with PRINT_LOCK:
+        if ACTIVE_PROGRESS:
+            sys.stdout.write('\r\x1b[2K')
         print(message, flush=True)
+        if ACTIVE_PROGRESS:
+            ACTIVE_PROGRESS.draw()
 
 
 def save(path, value):
@@ -275,19 +329,21 @@ class Workflow:
 
         rows = []
         pool = ThreadPoolExecutor(max_workers=self.args.jobs)
+        progress = FunctionProgress(len(tasks))
+        progress.start()
         try:
             # Bound queued work as well as active processes for very large inputs.
             for offset in range(0, len(tasks), self.args.jobs * 4):
                 futures = [pool.submit(work, item) for item in tasks[offset:offset + self.args.jobs * 4]]
                 for future in as_completed(futures):
                     rows.append(future.result())
-                    emit(f'[progress] {len(rows)}/{len(tasks)} functions; '
-                         f'{100 * len(rows) / len(tasks):.1f}%')
+                    progress.update(rows[-1])
         except BaseException:
             stop_children()
             raise
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
+            progress.close()
         result['functions'] = sorted(rows, key=lambda row: row['address'])
         result['pseudocode_emitted'] = sum(row.get('decompile', {}).get('status') == 'ok' for row in rows)
         result['resumed_functions'] = sum(row.get('resumed', False) for row in rows)
