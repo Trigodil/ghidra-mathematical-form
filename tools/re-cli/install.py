@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import tempfile
 
 HERE = Path(__file__).resolve().parent
 
@@ -35,7 +36,15 @@ def install(prefix, repo):
     def copy(src, relative):
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, target)
+        # Replace rather than truncate an analyzer that may still be running.
+        fd, temporary = tempfile.mkstemp(prefix='.' + target.name + '.', dir=target.parent)
+        os.close(fd)
+        try:
+            shutil.copy2(src, temporary)
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     for name in ('re_cli.py', 'inventory.py', 'bin/re-'):
         copy(HERE / name, name)
@@ -51,9 +60,15 @@ def install(prefix, repo):
         copy(spec, Path('backend/Ghidra/Processors/x86/data/languages') / spec.name)
     (destination / 'bin/re-').chmod(0o755)
     command.parent.mkdir(parents=True, exist_ok=True)
-    if command.is_symlink():
-        command.unlink()
-    command.symlink_to(Path('../lib/re-cli/bin/re-'))
+    fd, temporary = tempfile.mkstemp(prefix='.re-.', dir=command.parent)
+    os.close(fd)
+    os.unlink(temporary)
+    try:
+        os.symlink('../lib/re-cli/bin/re-', temporary)
+        os.replace(temporary, command)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
     print(f'Installed command: {command}')
     if str(command.parent) not in os.environ.get('PATH', '').split(os.pathsep):
         print(f'Add {command.parent} to PATH to invoke re- directly.')

@@ -26,6 +26,12 @@ public:
         }
     }
     void attach(ghidra::AddrSpace *s){space=s;}
+    bool executableAddress(uint64_t address) const {
+        for(const auto& p:segments)
+            if((p.p_flags&PF_X) && address>=p.p_vaddr && address-p.p_vaddr<p.p_filesz)
+                return true;
+        return false;
+    }
     void loadFill(ghidra::uint1 *out,ghidra::int4 size,const ghidra::Address& address) override {
         for(int i=0;i<size;++i) {
             auto a=address.getOffset()+uint64_t(i);bool found=false;
@@ -59,12 +65,28 @@ int main(int argc,char **argv) {
     try {
         fibers::require(argc==5,"Usage: core-decompile BINARY SPEC_DIRECTORY SYMBOL OUTPUT");
         ghidra::startDecompilerLibrary(std::vector<std::string>{argv[2]});
-        fibers::Elf elf(argv[1]);auto selected=elf.function(argv[3]);
+        fibers::Elf elf(argv[1]);
+        const std::string selector=argv[3];
+        uint64_t selectedAddress;
+        const bool byAddress=selector.compare(0,3,"@0x")==0;
+        if(byAddress) {
+            fibers::require(selector.size()>3 && selector.size()<=19 &&
+                selector.find_first_not_of("0123456789abcdefABCDEF",3)==std::string::npos,
+                "Invalid hexadecimal address selector");
+            selectedAddress=std::stoull(selector.substr(3),nullptr,16);
+        } else selectedAddress=elf.function(selector).address;
         StaticElfArchitecture arch(argv[1]);ghidra::DocumentStorage store;arch.init(store);
+        MappedElfImage* image=static_cast<MappedElfImage*>(arch.loader);
+        fibers::require(image->executableAddress(selectedAddress),"Selected address is not file-backed executable code");
         auto scope=arch.symboltab->getGlobalScope();std::unordered_set<uint64_t> added;
         for(const auto& symbol:elf.functions())if(added.insert(symbol.address).second)
             scope->addFunction(ghidra::Address(arch.getDefaultCodeSpace(),symbol.address),symbol.name);
-        auto fd=scope->queryFunction(ghidra::Address(arch.getDefaultCodeSpace(),selected.address));
+        ghidra::Address selected(arch.getDefaultCodeSpace(),selectedAddress);
+        if(added.insert(selectedAddress).second) {
+            std::ostringstream name;name<<"__recovered_"<<std::hex<<selectedAddress;
+            scope->addFunction(selected,name.str());
+        }
+        auto fd=scope->queryFunction(selected);
         fibers::require(fd!=nullptr,"Cannot create selected function");
         auto action=arch.allacts.getCurrent();auto peel=action->getSubRule("peel_multi_region");
         fibers::require(peel!=nullptr,"Updated peel_multi_region pass is absent from the action pool");

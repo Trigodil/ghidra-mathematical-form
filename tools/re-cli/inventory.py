@@ -33,6 +33,7 @@ def inventory(path):
         strings = sections[h[13]]
         names = span(strings[4], strings[5])
         bun = False
+        by_section_name = {}
         segments = []
         for i in range(h[10]):
             p = unpack('<IIQQQQQQ', h[5] + 56 * i)
@@ -44,7 +45,9 @@ def inventory(path):
         for s in sections:
             if s[0] >= len(names):
                 raise ValueError('Invalid section name')
-            bun |= names[s[0]:].split(b'\0', 1)[0] == b'.bun'
+            section_name = names[s[0]:].split(b'\0', 1)[0]
+            bun |= section_name == b'.bun'
+            by_section_name[section_name] = s
             if s[1] not in (2, 11):
                 continue
             if s[9] != 24 or s[5] % 24 or s[6] >= len(sections):
@@ -75,9 +78,122 @@ def inventory(path):
                 continue
             seen.add(address)
             valid = any(a <= address and address + size <= b for a, b in segments)
-            functions.append(dict(address=address, name=name, size=size, file_backed_code=valid))
+            functions.append(dict(address=address, name=name, size=size, file_backed_code=valid,
+                                  selector=name, provenance=['symbol']))
             if valid:
                 covered.append((address, address + size))
+        # The ELF entry and unwind search table supply entry-point evidence even
+        # when symbols are stripped.  Treat them as candidates, not proof of
+        # source recovery or of a function's full extent.
+        discovery_warnings = []
+        candidates = {}
+        def candidate(address, source):
+            if any(left <= address < right for left, right in segments):
+                candidates.setdefault(address, set()).add(source)
+        candidate(h[4], 'elf_entry')
+        hdr = by_section_name.get(b'.eh_frame_hdr')
+        frame = by_section_name.get(b'.eh_frame')
+        if hdr is not None and frame is not None:
+            try:
+                start, end, base = hdr[4], hdr[4] + hdr[5], hdr[3]
+                span(start, hdr[5]); span(frame[4], frame[5])
+                def read_num(pos, encoding, limit, virtual_base, data_base):
+                    if encoding == 0xff or encoding & 0x80:
+                        raise ValueError('unsupported omitted/indirect unwind encoding')
+                    form = encoding & 0x0f
+                    formats = {0:'Q', 2:'H', 3:'I', 4:'Q', 10:'h', 11:'i', 12:'q'}
+                    if form in formats:
+                        fmt = '<' + formats[form]; width = struct.calcsize(fmt)
+                        if pos + width > limit: raise ValueError('truncated unwind value')
+                        val = unpack(fmt, pos)[0]; newpos = pos + width
+                    elif form in (1, 9):
+                        val = 0; shift = 0; newpos = pos
+                        for _ in range(10):
+                            if newpos >= limit: raise ValueError('truncated unwind LEB')
+                            byte = data[newpos]; newpos += 1
+                            val |= (byte & 127) << shift; shift += 7
+                            if not byte & 128: break
+                        else: raise ValueError('oversized unwind LEB')
+                        if form == 9 and byte & 64: val -= 1 << shift
+                    else: raise ValueError('unsupported unwind value encoding')
+                    mode = encoding & 0x70
+                    if mode == 0x10: val += virtual_base + (pos - start)
+                    elif mode == 0x30: val += data_base
+                    elif mode != 0: raise ValueError('unsupported unwind relative encoding')
+                    return val, newpos
+                if hdr[5] < 4 or data[start] != 1: raise ValueError('unsupported unwind header')
+                eh_enc, count_enc, table_enc = data[start+1:start+4]
+                pointer, pos = read_num(start+4, eh_enc, end, base, base)
+                if pointer != frame[3]: raise ValueError('unwind header points outside .eh_frame')
+                count, pos = read_num(pos, count_enc, end, base, base)
+                if count < 0 or count > 2000000 or count > (end-pos)//2:
+                    raise ValueError('invalid unwind entry count')
+                # Fixed-width encodings are the usual ELF search table; validate
+                # the referenced FDE record and its CIE before accepting a row.
+                cie_encodings = {}
+                def fde_encoding(cie, fde):
+                    if cie in cie_encodings: return cie_encodings[cie]
+                    cie_length = unpack('<I', cie)[0]
+                    cie_end = cie+4+cie_length
+                    if cie_length < 5 or cie_end > fde: raise ValueError('invalid unwind CIE length')
+                    version = data[cie+8]; cursor = cie+9
+                    if version not in (1, 3, 4): raise ValueError('unsupported unwind CIE version')
+                    zero = data.find(b'\0', cursor, cie_end)
+                    if zero < 0: raise ValueError('unterminated unwind CIE augmentation')
+                    aug = data[cursor:zero]; cursor = zero+1
+                    if version == 4:
+                        if cursor+2 > cie_end or data[cursor] != 8: raise ValueError('unsupported unwind address size')
+                        cursor += 2
+                    _, cursor = read_num(cursor, 1, cie_end, frame[3]+start-frame[4], frame[3])
+                    _, cursor = read_num(cursor, 9, cie_end, frame[3]+start-frame[4], frame[3])
+                    _, cursor = read_num(cursor, 1 if version != 1 else 2, cie_end, frame[3]+start-frame[4], frame[3]) if version != 1 else (data[cursor], cursor+1)
+                    encoding = 0
+                    if aug:
+                        if not aug.startswith(b'z'): raise ValueError('unsupported unwind CIE augmentation')
+                        length, cursor = read_num(cursor, 1, cie_end, frame[3]+start-frame[4], frame[3])
+                        aug_end = cursor+length
+                        if aug_end > cie_end: raise ValueError('truncated unwind augmentation')
+                        for ch in aug[1:]:
+                            if ch in (ord('R'), ord('L')):
+                                if cursor >= aug_end: raise ValueError('truncated unwind augmentation')
+                                if ch == ord('R'): encoding = data[cursor]
+                                cursor += 1
+                            elif ch == ord('P'):
+                                if cursor >= aug_end: raise ValueError('truncated unwind personality')
+                                personality_enc=data[cursor]; cursor+=1
+                                # An indirect personality pointer still occupies an encoded value.
+                                _,cursor=read_num(cursor,personality_enc & 0x7f,aug_end,frame[3]+start-frame[4],frame[3])
+                            elif ch != ord('S'): raise ValueError('unsupported unwind augmentation')
+                    cie_encodings[cie]=encoding
+                    return encoding
+                for _ in range(count):
+                    address, pos = read_num(pos, table_enc, end, base, base)
+                    fde_address, pos = read_num(pos, table_enc, end, base, base)
+                    off = frame[4] + fde_address - frame[3]
+                    if off < frame[4] or off + 8 > frame[4]+frame[5]:
+                        raise ValueError('unwind table points outside .eh_frame')
+                    length, cie_delta = unpack('<II', off)
+                    if length < 4 or length == 0xffffffff or off+4+length > frame[4]+frame[5] or not cie_delta:
+                        raise ValueError('invalid unwind FDE')
+                    cie = off + 4 - cie_delta
+                    if cie < frame[4] or cie+8 > off or unpack('<I',cie+4)[0] != 0:
+                        raise ValueError('invalid unwind CIE reference')
+                    enc=fde_encoding(cie,off)
+                    actual, _ = read_num(off+8, enc, off+4+length, frame[3]+start-frame[4], frame[3])
+                    if actual != address: raise ValueError('unwind FDE entry does not match search table')
+                    candidate(address, 'eh_frame_hdr')
+            except (ValueError, struct.error, IndexError) as error:
+                discovery_warnings.append('Unwind discovery incomplete: ' + str(error))
+        rows_by_address = {row['address']: row for row in functions}
+        for address, provenance in sorted(candidates.items()):
+            if address in rows_by_address:
+                rows_by_address[address]['provenance'].extend(sorted(provenance))
+            else:
+                row = dict(address=address, name=f'sub_{address:x}', size=0,
+                           file_backed_code=True, selector=f'@0x{address:x}',
+                           provenance=sorted(provenance))
+                functions.append(row)
+        functions.sort(key=lambda item: (item['address'], item['name']))
         def union_bytes(ranges):
             end, total = -1, 0
             for left, right in sorted(ranges):
@@ -85,7 +201,11 @@ def inventory(path):
                 end = max(end, right)
             return total
         return dict(functions=functions, bun=bun, executable_bytes=union_bytes(segments),
-                    named_code_bytes=union_bytes(covered), ambiguous_names=sorted(ambiguous))
+                    named_code_bytes=union_bytes(covered), ambiguous_names=sorted(ambiguous),
+                    discovery=dict(elf_entry=sum('elf_entry' in p for p in candidates.values()),
+                                   eh_frame_hdr=sum('eh_frame_hdr' in p for p in candidates.values()),
+                                   unnamed=sum(row['size'] == 0 for row in functions),
+                                   warnings=discovery_warnings))
 
 
 if __name__ == '__main__':

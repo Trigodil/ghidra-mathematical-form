@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -103,7 +104,7 @@ class WorkflowTests(unittest.TestCase):
         empty.mkdir()
         self.assertEqual(self.invoke(empty, '-o', self.root / 'empty-output').returncode, 2)
 
-    def test_stripped_binary_preserves_assembly_and_reports_no_functions(self):
+    def test_stripped_binary_recovers_unwind_entries(self):
         binary = self.root / 'stripped'
         shutil.copyfile(self.binary, binary)
         subprocess.run(['strip', '--strip-all', str(binary)], check=True)
@@ -111,9 +112,33 @@ class WorkflowTests(unittest.TestCase):
         run = self.invoke(binary, '-o', output)
         self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
         report = json.loads((output / 'report.json').read_text())['binaries'][0]
-        self.assertEqual(report['functions_discovered'], 0)
+        self.assertGreater(report['discovery']['eh_frame_hdr'], 0)
+        self.assertGreater(report['discovery']['unnamed'], 0)
+        self.assertGreater(report['pseudocode_emitted'], 0)
+        recovered = next(row for row in report['functions'] if row['size'] == 0 and row['status'] == 'ok')
+        self.assertIn('eh_frame_hdr', recovered['provenance'])
+        output_c = Path(report['output']) / 'functions' / f'{recovered["address"]:x}' / 'decompiled.c'
+        self.assertIn('__recovered_', output_c.read_text())
         self.assertEqual(report['assembly']['status'], 'ok')
         self.assertGreater(Path(report['assembly']['log']).stat().st_size, 100)
+
+    def test_malformed_unwind_table_is_bounded_and_reported(self):
+        import inventory
+        data = bytearray(self.binary.read_bytes())
+        header = struct.unpack_from('<16sHHIQQQIHHHHHH', data)
+        sections = [struct.unpack_from('<IIQQQQIIQQ', data, header[6]+64*i)
+                    for i in range(header[12])]
+        names_section = sections[header[13]]
+        names = data[names_section[4]:names_section[4]+names_section[5]]
+        hdr = next(sec for sec in sections if names[sec[0]:].split(b'\0',1)[0] == b'.eh_frame_hdr')
+        self.assertEqual(data[hdr[4]+2], 3)  # DW_EH_PE_udata4 count
+        struct.pack_into('<I', data, hdr[4]+8, 0xffffffff)
+        malformed = self.root / 'bad-unwind'
+        malformed.write_bytes(data)
+        result = inventory.inventory(malformed)
+        self.assertTrue(result['discovery']['warnings'])
+        self.assertEqual(result['discovery']['eh_frame_hdr'], 0)
+        self.assertTrue(any(row['name']=='add' for row in result['functions']))
 
     def test_output_lock_and_checkout_write_rejection(self):
         output = self.root / 'locked-output'

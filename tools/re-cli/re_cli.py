@@ -282,7 +282,8 @@ class Workflow:
         tasks = inventory['functions']
         result.update(executable_bytes=inventory['executable_bytes'],
                       named_code_bytes=inventory['named_code_bytes'], functions_discovered=len(tasks),
-                      ambiguous_names=inventory['ambiguous_names'], whole_binary_recovered=False)
+                      ambiguous_names=inventory['ambiguous_names'], discovery=inventory.get('discovery', {}),
+                      whole_binary_recovered=False)
         # Keep an assembly view of executable sections, including stripped code
         # outside named sized function ranges. This does not infer function bounds.
         assembly = folder / 'assembly'
@@ -311,18 +312,23 @@ class Workflow:
             row = dict(**item, fingerprint=fingerprint)
             (out / 'decompiled.c').unlink(missing_ok=True)
             row['decompile'] = self.restricted([self.tools['core-decompile'], source, self.specs,
-                                                item['name'], out], source, out,
+                                                item.get('selector', item['name']), out], source, out,
                                                 label=f'decompile {item["name"]} @ 0x{item["address"]:x}')
             row['status'] = row['decompile']['status']
             if row['status'] == 'ok' and not (out / 'decompiled.c').is_file():
                 row['status'] = 'missing_pseudocode'
             if self.args.symbolic:
-                symbolic = out / 'symbolic'
-                row['symbolic'] = self.restricted([self.tools['native-audit'], 'lift', source,
-                    self.specs / 'x86-64.sla', symbolic, item['name']], source, symbolic,
-                    label=f'symbolic {item["name"]} @ 0x{item["address"]:x}')
-                if row['symbolic']['status'] != 'ok':
-                    row['status'] = 'partial'
+                if item.get('selector', item['name']).startswith('@0x'):
+                    row['symbolic'] = dict(status='unsupported', reason='Symbolic lifting requires a named, sized ELF symbol')
+                    if row['status'] == 'ok':
+                        row['status'] = 'partial'
+                else:
+                    symbolic = out / 'symbolic'
+                    row['symbolic'] = self.restricted([self.tools['native-audit'], 'lift', source,
+                        self.specs / 'x86-64.sla', symbolic, item['name']], source, symbolic,
+                        label=f'symbolic {item["name"]} @ 0x{item["address"]:x}')
+                    if row['symbolic']['status'] != 'ok':
+                        row['status'] = 'partial'
             emit(f'[function {item["name"]} @ 0x{item["address"]:x}] {row["status"]}')
             save(checkpoint, row)
             return row
@@ -352,9 +358,10 @@ class Workflow:
                       or any(row['status'] != 'ok' for row in rows) or not result['target_unchanged']
                       or result['assembly']['status'] != 'ok'
                       or result['decoder']['status'] != 'ok' or bool(inventory['ambiguous_names'])
+                      or bool(inventory.get('discovery', {}).get('warnings'))
                       or result.get('bun_extraction', {}).get('status', 'ok') != 'ok')
         result['status'] = 'partial' if incomplete else 'ok'
-        result['limits'] = ['Named sized functions only; stripped/unsymbolized code is not decompiled.',
+        result['limits'] = ['Unwind-table and ELF-entry candidates may be incomplete; unnamed function sizes are unknown.',
                            'Executable-section assembly is linear disassembly, not recovered source or flow coverage.',
                            'Pseudocode is heuristic; original source and equivalence are not established.',
                            'External dependencies and files behind symlinks are outside this scan.',
@@ -408,7 +415,7 @@ def print_summary(report, elapsed):
          f'{sum(s["status"] == "interrupted" for s in stages)} interrupted')
     emit(f'Pseudocode files: {emitted} | Resumed functions: {resumed} | '
          f'Skipped files/directories: {len(report["skipped"])} | Elapsed: {elapsed:.2f}s')
-    emit('Function totals cover identified named functions; unsymbolized code is outside decompilation coverage.')
+    emit('Function totals cover named and discovered entry candidates; other code may remain undiscovered.')
 
 
 def main(argv=None):
