@@ -1,0 +1,3 @@
+# This bin directory contains the source launcher, not generated binaries.
+!bin/
+!bin/re-

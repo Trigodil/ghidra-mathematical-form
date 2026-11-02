@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Analyze every supported binary in an application directory using this Ghidra fork."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from re_cli import main
+
+if __name__ == '__main__':
+    raise SystemExit(main())
