@@ -12,7 +12,7 @@ HERE = Path(__file__).resolve().parent
 
 def install(prefix, repo):
     source = repo / 'research/graph_fibers/cpp'
-    binaries = ['core-decompile', 'native-audit', 'analysis-lockdown.so']
+    binaries = ['core-decompile', 'native-audit', 'native-discover', 'analysis-lockdown.so']
     required = [source / 'build' / name for name in binaries]
     required += [source / '.deps/spec/x86-64.sla', source / 'extract_bun_static.py']
     z3libs = list((source / '.deps/z3/lib').glob('libz3.so*'))

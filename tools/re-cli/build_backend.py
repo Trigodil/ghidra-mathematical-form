@@ -45,7 +45,8 @@ def build(jobs):
     common = ['-L' + str(ROOT / '.deps/z3/lib'), '-Wl,-rpath,$ORIGIN/../.deps/z3/lib',
               '-lz3', '-l:libz.so.1']
     for name, source, group in [('core-decompile', 'core_decompile.cpp', all_names),
-                                ('native-audit', 'native_audit.cpp', sleigh)]:
+                                ('native-audit', 'native_audit.cpp', sleigh),
+                                ('native-discover', 'native_discover.cpp', sleigh)]:
         subprocess.run([*flags, str(ROOT / source), *(str(objects[n]) for n in group),
                         *common, '-o', str(ROOT / 'build' / name)], check=True)
     subprocess.run([os.environ.get('CC', 'gcc'), '-shared', '-fPIC', '-O2', '-Wall', '-Wextra',

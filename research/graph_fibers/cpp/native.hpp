@@ -96,6 +96,18 @@ public:
     explicit Elf(const std::filesystem::path& path):data(path){}
     const std::vector<NamedFunction>& functions() const{index();return list;}
     uint64_t file_size() const{return data.size();}
+    std::vector<Function> executable_images() const {
+        auto h=header(); std::vector<Function> result;
+        for(unsigned i=0;i<h.e_phnum;++i) {
+            auto p=record<Elf64_Phdr>(h.e_phoff+uint64_t(i)*sizeof(Elf64_Phdr));
+            if(p.p_type!=PT_LOAD || !(p.p_flags&PF_X) || !p.p_filesz) continue;
+            supported(range(p.p_offset,p.p_filesz,data.size()) && p.p_vaddr<=UINT64_MAX-p.p_filesz,
+                      "Invalid executable segment");
+            const auto* begin=data.begin()+p.p_offset;
+            result.push_back({p.p_vaddr,std::vector<uint8_t>(begin,begin+p.p_filesz)});
+        }
+        return result;
+    }
     uint64_t executable_bytes() const {
         auto h=header();uint64_t bytes=0;
         for(unsigned i=0;i<h.e_phnum;++i){auto p=record<Elf64_Phdr>(h.e_phoff+uint64_t(i)*sizeof(Elf64_Phdr));

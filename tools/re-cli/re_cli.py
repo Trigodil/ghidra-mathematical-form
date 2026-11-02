@@ -216,7 +216,7 @@ class Workflow:
             raise ValueError('Output must be outside the checkout')
         # Fail early instead of implicitly building/writing into the checkout.
         self.tools = {name: self.backend / 'build' / name for name in
-                      ('core-decompile', 'analysis-lockdown.so', 'native-audit')}
+                      ('core-decompile', 'analysis-lockdown.so', 'native-audit', 'native-discover')}
         for path in [*self.tools.values(), self.backend / '.deps/spec/x86-64.sla']:
             if not path.is_file():
                 raise ValueError(f'Missing prepared backend: {path}')
@@ -280,6 +280,33 @@ class Workflow:
             return result
         inventory = json.loads((inv / 'inventory.json').read_text())
         tasks = inventory['functions']
+        discovery = folder / 'recursive-discovery'
+        discovery.mkdir(parents=True, exist_ok=True)
+        (discovery / 'seeds.txt').write_text(''.join(f'{row["address"]:x}\n' for row in tasks
+                                                     if row['file_backed_code']))
+        result['recursive_discovery'] = self.restricted([self.tools['native-discover'], source,
+            self.specs / 'x86-64.sla', discovery / 'seeds.txt', discovery, '2000000'],
+            source, discovery, self.args.stage_timeout)
+        if result['recursive_discovery']['status'] == 'ok':
+            stats = json.loads((discovery / 'recursive-stats.json').read_text())
+            inventory['discovery']['recursive'] = stats
+            known = {row['address']: row for row in tasks}
+            for line in (discovery / 'recursive.tsv').read_text().splitlines()[1:]:
+                address_text, caller_text = line.split('\t')
+                address, caller = int(address_text, 16), int(caller_text, 16)
+                if address not in known:
+                    row = dict(address=address, name=f'sub_{address:x}', size=0,
+                               file_backed_code=True, selector=f'@0x{address:x}',
+                               provenance=['direct_call'], discovered_from=caller)
+                    tasks.append(row); known[address] = row
+                elif 'direct_call' not in known[address]['provenance']:
+                    known[address]['provenance'].append('direct_call')
+            tasks.sort(key=lambda row: (row['address'], row['name']))
+            inventory['discovery']['direct_call'] = sum('direct_call' in row['provenance'] for row in tasks)
+            if stats['truncated'] or stats['decode_errors']:
+                inventory['discovery']['warnings'].append('Recursive discovery was truncated or encountered decode errors')
+        else:
+            inventory['discovery']['warnings'].append('Recursive discovery stage failed or timed out')
         result.update(executable_bytes=inventory['executable_bytes'],
                       named_code_bytes=inventory['named_code_bytes'], functions_discovered=len(tasks),
                       ambiguous_names=inventory['ambiguous_names'], discovery=inventory.get('discovery', {}),
@@ -361,7 +388,7 @@ class Workflow:
                       or bool(inventory.get('discovery', {}).get('warnings'))
                       or result.get('bun_extraction', {}).get('status', 'ok') != 'ok')
         result['status'] = 'partial' if incomplete else 'ok'
-        result['limits'] = ['Unwind-table and ELF-entry candidates may be incomplete; unnamed function sizes are unknown.',
+        result['limits'] = ['Recursive discovery follows direct calls and reachable branches within budgets; indirect transfers and tail calls remain unresolved, and unnamed function sizes are unknown.',
                            'Executable-section assembly is linear disassembly, not recovered source or flow coverage.',
                            'Pseudocode is heuristic; original source and equivalence are not established.',
                            'External dependencies and files behind symlinks are outside this scan.',
