@@ -1126,6 +1126,91 @@ int4 RulePushMulti::applyOp(PcodeOp *op,Funcdata &data)
   return 1;
 }
 
+// Only total, deterministic scalar operations with no hidden state are eligible.
+static bool peelPureOp(OpCode opc)
+{
+  switch(opc) {
+  case CPUI_COPY: case CPUI_INT_ADD: case CPUI_INT_SUB: case CPUI_INT_MULT:
+  case CPUI_INT_XOR: case CPUI_INT_AND: case CPUI_INT_OR:
+  case CPUI_INT_NEGATE: case CPUI_INT_2COMP:
+    return true;
+  default: return false;
+  }
+}
+
+void RulePeelMultiRegion::getOpList(vector<uint4> &oplist) const
+{
+  oplist.push_back(CPUI_MULTIEQUAL);
+}
+
+int4 RulePeelMultiRegion::applyOp(PcodeOp *op,Funcdata &data)
+{
+  const int4 n = op->numInput();
+  BlockBasic *join = op->getParent();
+  if (n < 3 || join == (BlockBasic *)0 || join->sizeIn() != n) return 0;
+  FlowBlock *root = (FlowBlock *)0;
+  vector<PcodeOp *> definitions;
+  for(int4 i=0;i<n;++i) {
+    FlowBlock *arm = join->getIn(i);
+    if (arm->getType()!=FlowBlock::t_basic || arm == join || arm->sizeIn()!=1 ||
+        arm->sizeOut()!=1 || arm->getOut(0)!=join)
+      return 0;
+    if (i==0) root=arm->getIn(0);
+    if (arm->getIn(0)!=root || root==join || root==arm) return 0;
+    for(int4 j=0;j<i;++j) if (join->getIn(j)==arm) return 0;
+    Varnode *vn = op->getIn(i);
+    if (!vn->isWritten() || vn->isAddrTied() || vn->isSpacebase() || vn->loneDescend()!=op)
+      return 0;
+    PcodeOp *def = vn->getDef();
+    if (def->getParent()!=arm || !peelPureOp(def->code())) return 0;
+    BlockBasic *basic = (BlockBasic *)arm;
+    for(list<PcodeOp *>::const_iterator it=basic->beginOp();it!=basic->endOp();++it) {
+      OpCode code=(*it)->code();
+      if (code!=CPUI_BRANCH && !peelPureOp(code)) return 0;
+    }
+    definitions.push_back(def);
+  }
+  if (root->sizeOut()!=n) return 0;
+  // Reject regions on a cycle, including paths back through the join.
+  set<FlowBlock *> seen;
+  vector<FlowBlock *> pending(1,join);
+  while(!pending.empty()) {
+    FlowBlock *node=pending.back(); pending.pop_back();
+    if (node==root) return 0;
+    if (!seen.insert(node).second) continue;
+    if (seen.size()>4096) return 0;
+    for(int4 i=0;i<node->sizeOut();++i) pending.push_back(node->getOut(i));
+  }
+  PcodeOp *first=definitions[0];
+  for(int4 slot=0;slot<first->numInput();++slot) {
+    Varnode *input=first->getIn(slot);
+    if (input->isFree() && !input->isConstant()) return 0;
+    if (input->isAddrTied() || input->isSpacebase()) return 0;
+    if (input->isWritten()) {
+      BlockBasic *parent=input->getDef()->getParent();
+      if (parent==(BlockBasic *)0 || !parent->dominates(root)) return 0;
+    }
+    for(int4 i=1;i<n;++i) {
+      PcodeOp *other=definitions[i];
+      if (other->code()!=first->code() || other->numInput()!=first->numInput() ||
+          other->getOut()->getSize()!=first->getOut()->getSize()) return 0;
+      Varnode *otherInput=other->getIn(slot);
+      if (input!=otherInput && !(input->isConstant() && otherInput->isConstant() &&
+            input->getSize()==otherInput->getSize() && input->getOffset()==otherInput->getOffset()))
+        return 0;
+    }
+  }
+  // Each incoming value is f(the same inputs); selecting among them equals f.
+  // Keep the control-flow graph and all other arm operations unchanged.
+  Varnode *out=op->getOut();
+  data.opSetOutput(first,out);
+  data.opUninsert(first);
+  data.opInsertBegin(first,join);
+  data.opDestroy(op);
+  for(int4 i=1;i<n;++i) data.opDestroy(definitions[i]);
+  return 1;
+}
+
 /// \class RuleNotDistribute
 /// \brief Distribute BOOL_NEGATE:  `!(V && W)  =>  !V || !W`
 void RuleNotDistribute::getOpList(vector<uint4> &oplist) const

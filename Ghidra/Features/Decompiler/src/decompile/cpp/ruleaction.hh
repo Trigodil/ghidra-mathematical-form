@@ -290,6 +290,17 @@ public:
   virtual void getOpList(vector<uint4> &oplist) const;
   virtual int4 applyOp(PcodeOp *op,Funcdata &data);
 };
+/// Factor a common pure operation from every arm of a direct multi-way join.
+class RulePeelMultiRegion : public Rule {
+public:
+  RulePeelMultiRegion(const string &g) : Rule(g, 0, "peel_multi_region") {}
+  virtual Rule *clone(const ActionGroupList &grouplist) const {
+    if (!grouplist.contains(getGroup())) return (Rule *)0;
+    return new RulePeelMultiRegion(getGroup());
+  }
+  virtual void getOpList(vector<uint4> &oplist) const;
+  virtual int4 applyOp(PcodeOp *op,Funcdata &data);
+};
 class RuleNotDistribute : public Rule {
 public:
   RuleNotDistribute(const string &g) : Rule(g, 0, "notdistribute") {}	///< Constructor

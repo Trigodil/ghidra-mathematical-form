@@ -5906,6 +5906,7 @@ void ActionDatabase::universalAction(Architecture *conf)
 	actprop->addRule( new RuleCollectTerms("analysis"));
 	actprop->addRule( new RulePullsubMulti("analysis"));
 	actprop->addRule( new RulePullsubIndirect("analysis"));
+	actprop->addRule( new RulePeelMultiRegion("nodejoin"));
 	actprop->addRule( new RulePushMulti("nodejoin"));
 	actprop->addRule( new RuleSborrow("analysis") );
 	actprop->addRule( new RuleScarry("analysis") );
