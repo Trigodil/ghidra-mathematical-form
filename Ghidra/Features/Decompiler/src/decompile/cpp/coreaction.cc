@@ -3876,17 +3876,19 @@ void ActionDeadCode::propagateConsumed(vector<Varnode *> &worklist)
     pushConsumed(outc,op->getIn(0),worklist);
     if (op->getIn(1)->getSpace()->getType()==IPTR_IOP) {
       PcodeOp *indop = PcodeOp::getOpFromConst(op->getIn(1)->getAddr());
-      if (!indop->isDead()) {
-	if (indop->code() == CPUI_COPY) {
-	  if (indop->getOut()->characterizeOverlap(*op->getOut())>0) {
-	    pushConsumed(~((uintb)0),indop->getOut(),worklist);	// Mark the copy as consumed
-	    indop->setIndirectSource();
-	  }
-	  // If we reach here, there isn't a true block of INDIRECT (RuleIndirectCollapse will convert it to COPY)
-	}
-	else
-	  indop->setIndirectSource();
+      if (indop->isDead()) {
+	ostringstream s;
+	s << "Hanging INDIRECT at " << op->getAddr();
+	throw LowlevelError(s.str());
       }
+      if (indop->code() == CPUI_COPY) {
+	if (indop->getOut()->characterizeOverlap(*op->getOut())>0) {
+	  pushConsumed(~((uintb)0),indop->getOut(),worklist);	// Mark the copy as consumed
+	  indop->setIndirectSource();
+	}
+      }
+      else
+	indop->setIndirectSource();
     }
     break;
   case CPUI_COPY:
@@ -3961,6 +3963,12 @@ void ActionDeadCode::propagateConsumed(vector<Varnode *> &worklist)
 	a = 0;			// We know nothing about the low order consumption of the input bits
       else
 	a = outc << sa;		// Most cases just do this
+      if ((a==0)&&(outc!=0)&&(op->getIn(0)->getSize() > sizeof(uintb))) {
+	// The consumed bits were shifted beyond the precision of the consume field,
+	// but bits of the input above the field are still consumed
+	a = ~((uintb)0);
+	a = a ^ (a >> 1);	// Set the highest bit possible in the mask to indicate some consumption
+      }
       b = (outc == 0) ? 0 : ~((uintb)0);
       pushConsumed(a,op->getIn(0),worklist);
       pushConsumed(b,op->getIn(1),worklist);
