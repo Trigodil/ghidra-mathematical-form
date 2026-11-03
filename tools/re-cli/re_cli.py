@@ -239,6 +239,7 @@ class Workflow:
         for path in [*self.tools.values(), self.backend / '.deps/spec/x86-64.sla']:
             if not path.is_file():
                 raise ValueError(f'Missing prepared backend: {path}')
+        self.native_identity = digest(self.tools['core-decompile'])
         if not Path('/usr/bin/objdump').is_file():
             raise ValueError('Missing /usr/bin/objdump (binutils)')
         self.specs = self.output / 'specs'
@@ -252,6 +253,7 @@ class Workflow:
         for source in sorted([*sources, *self.tools.values(), HERE / 're_cli.py', HERE / 'inventory.py',
                               HERE / 'full_recovery.py', HERE / 'recovery_build.py',
                               HERE / 'source_project.py',
+                              HERE / 'global_state.py',
                               Path('/usr/bin/objdump')]):
             fingerprint.update(str(source).encode())
             fingerprint.update(bytes.fromhex(digest(source)))
@@ -359,8 +361,9 @@ class Workflow:
                     row['resumed'] = True
                     emit(f'[function {item["name"]} @ 0x{item["address"]:x}] resumed successful result')
                     return row
-            row = dict(**item, fingerprint=fingerprint)
+            row = dict(**item, fingerprint=fingerprint, metadata_backend=self.native_identity)
             (out / 'decompiled.c').unlink(missing_ok=True)
+            (out / 'globals.json').unlink(missing_ok=True)
             row['decompile'] = self.restricted([self.tools['core-decompile'], source, self.specs,
                                                 item.get('selector', item['name']), out], source, out,
                                                 label=f'decompile {item["name"]} @ 0x{item["address"]:x}')
@@ -531,13 +534,21 @@ class Workflow:
         known = {row['address']: row for row in rows}
         pending, examined, attempted = set(), set(), set()
         deadline = time.monotonic() + self.args.stage_timeout
-        state = dict(status='running', attempts=0, new_functions=0,
+        state = dict(status='running', attempts=0, new_functions=0, refreshed_functions=0,
                      flow_completeness_proved=False, pending=[], failed=[])
         for row in rows:
-            if not (folder / 'functions' / f'{row["address"]:x}' / 'decompiled.c').is_file():
+            directory = folder / 'functions' / f'{row["address"]:x}'
+            try:
+                current_metadata = (json.loads((directory / 'globals.json').read_text()).get('version') == 2
+                                    and row.get('metadata_backend') == self.native_identity)
+            except (OSError, ValueError, AttributeError):
+                current_metadata = False
+            if not (directory / 'decompiled.c').is_file():
                 state['failed'].append(row['address'])
                 if self.args.fresh:
                     pending.add(row['address'])
+            elif self.args.fresh or not current_metadata:
+                pending.add(row['address'])
 
         def scan_row(row):
             address = row['address']
@@ -546,7 +557,15 @@ class Workflow:
             examined.add(address)
             path = folder / 'functions' / f'{address:x}' / 'decompiled.c'
             if path.is_file():
-                for target_address in source_project.call_addresses(path.read_text(errors='replace')):
+                targets = source_project.call_addresses(path.read_text(errors='replace'))
+                metadata = path.parent / 'globals.json'
+                if metadata.is_file():
+                    data = json.loads(metadata.read_text())
+                    for item in data.get('globals', []):
+                        target_address = item.get('pointer_target')
+                        if item.get('pointer_target_is_code') and type(target_address) is int and 0 <= target_address < 2**64:
+                            targets.add(target_address)
+                for target_address in targets:
                     if target_address not in known and target_address not in attempted:
                         pending.add(target_address)
         for row in rows:
@@ -563,8 +582,11 @@ class Workflow:
             out = folder / 'functions' / f'{address:x}'
             out.mkdir(parents=True, exist_ok=True)
             (out / 'decompiled.c').unlink(missing_ok=True)
+            (out / 'globals.json').unlink(missing_ok=True)
+            refreshing = address in known
             row = dict(address=address, name=f'__recovered_{address:x}', size=0,
-                       selector=f'@0x{address:x}', provenance=['pseudocode_call_candidate'])
+                       selector=f'@0x{address:x}', provenance=['pseudocode_call_candidate'],
+                       metadata_backend=self.native_identity)
             row['decompile'] = self.restricted([self.tools['core-decompile'], source, self.specs,
                 row['selector'], out], source, out, min(remaining, self.args.function_timeout),
                 label=f'recover callee 0x{address:x}')
@@ -582,7 +604,7 @@ class Workflow:
                     if flags.get('unimplemented') == '1' or flags.get('bad_data') == '1' or row['warnings']:
                         if row['status'] == 'ok':
                             row['status'] = 'partial'
-                state['new_functions'] += 1
+                state['refreshed_functions' if refreshing else 'new_functions'] += 1
             if address in known:
                 previous = known[address]
                 previous.clear()
@@ -603,6 +625,8 @@ class Workflow:
         else:
             state['status'] = 'unresolved' if state['failed'] else 'direct_callee_fixed_point'
         state['pending'] = sorted(pending)
+        state['functions_without_global_metadata'] = [row['address'] for row in rows
+            if not (folder / 'functions' / f'{row["address"]:x}' / 'globals.json').is_file()]
         result['source_dependencies'] = state
         result['functions'] = sorted(rows, key=lambda row: row['address'])
         result['functions_discovered'] = len(rows)
@@ -632,6 +656,11 @@ class Workflow:
             destination.unlink(missing_ok=True)
             if source_file.is_file():
                 shutil.copyfile(source_file, destination)
+            metadata_source = source_file.parent / 'globals.json'
+            metadata_destination = destination.parent / 'globals.json'
+            metadata_destination.unlink(missing_ok=True)
+            if metadata_source.is_file():
+                shutil.copyfile(metadata_source, metadata_destination)
         result.update(output=str(folder), whole_binary_recovered=False,
                       imported_analysis=str(self.args.reuse_analysis.resolve()),
                       imported_analysis_sha256=self.previous_analysis_hash, target_unchanged=True)

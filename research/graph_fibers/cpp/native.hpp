@@ -19,6 +19,7 @@ inline void supported(bool value, const std::string& message) {
 
 struct Function { uint64_t address; std::vector<uint8_t> bytes; };
 struct NamedFunction {std::string name;uint64_t address,size;};
+struct NamedData {std::string name;uint64_t address,size;};
 class ReadOnlyFile {
     void* mapping=MAP_FAILED;size_t length=0;
 public:
@@ -44,6 +45,7 @@ class Elf {
     mutable std::unordered_map<std::string,std::pair<uint64_t,uint64_t>> names;
     mutable std::unordered_set<std::string> ambiguous;
     mutable std::vector<NamedFunction> list;
+    mutable std::vector<NamedData> dataSymbols;
     template<class T> T record(uint64_t offset) const {
         supported(offset <= data.size() && sizeof(T) <= data.size()-offset, "Truncated ELF record");
         T value; std::memcpy(&value, data.data()+offset, sizeof(T)); return value;
@@ -66,6 +68,8 @@ class Elf {
     void index() const {
         if(indexed)return;
         auto header=this->header();
+        std::unordered_map<std::string,std::pair<uint64_t,uint64_t>> objects;
+        std::unordered_set<std::string> ambiguousObjects;
         for (unsigned i = 0; i < header.e_shnum; ++i) {
             auto section = record<Elf64_Shdr>(header.e_shoff + uint64_t(i)*sizeof(Elf64_Shdr));
             if (section.sh_type != SHT_SYMTAB && section.sh_type != SHT_DYNSYM) continue;
@@ -76,7 +80,8 @@ class Elf {
             supported(range(strings.sh_offset, strings.sh_size, data.size()), "Invalid symbol string table");
             for (uint64_t j = 0; j < section.sh_size/sizeof(Elf64_Sym); ++j) {
                 auto symbol = record<Elf64_Sym>(section.sh_offset + j*sizeof(Elf64_Sym));
-                if (ELF64_ST_TYPE(symbol.st_info) != STT_FUNC || symbol.st_shndx == SHN_UNDEF || symbol.st_size==0) continue;
+                auto kind=ELF64_ST_TYPE(symbol.st_info);
+                if ((kind!=STT_FUNC && kind!=STT_OBJECT) || symbol.st_shndx == SHN_UNDEF || symbol.st_size==0) continue;
                 supported(symbol.st_name < strings.sh_size, "Invalid symbol name offset");
                 const char* text = reinterpret_cast<const char*>(data.data()+strings.sh_offset+symbol.st_name);
                 auto available = strings.sh_size-symbol.st_name;
@@ -84,17 +89,25 @@ class Elf {
                 supported(end != nullptr, "Unterminated symbol name");
                 std::string name(text,end);if(name.empty())continue;
                 const auto found = std::make_pair(symbol.st_value, symbol.st_size);
+                if(kind==STT_OBJECT) {
+                    auto [it,inserted]=objects.emplace(name,found);
+                    if(!inserted && it->second!=found) ambiguousObjects.insert(name);
+                    continue;
+                }
                 auto [it,inserted]=names.emplace(name,found);
                 if(!inserted&&it->second!=found)ambiguous.insert(name);
             }
         }
         for(const auto& [name,value]:names)if(!ambiguous.count(name))list.push_back({name,value.first,value.second});
         std::sort(list.begin(),list.end(),[](const auto& a,const auto& b){return a.address!=b.address?a.address<b.address:a.name<b.name;});
+        for(const auto& [name,value]:objects) if(!ambiguousObjects.count(name)) dataSymbols.push_back({name,value.first,value.second});
+        std::sort(dataSymbols.begin(),dataSymbols.end(),[](const auto& a,const auto& b){return a.address!=b.address?a.address<b.address:a.name<b.name;});
         indexed=true;
     }
 public:
     explicit Elf(const std::filesystem::path& path):data(path){}
     const std::vector<NamedFunction>& functions() const{index();return list;}
+    const std::vector<NamedData>& objects() const{index();return dataSymbols;}
     uint64_t file_size() const{return data.size();}
     std::vector<Function> executable_images() const {
         auto h=header(); std::vector<Function> result;

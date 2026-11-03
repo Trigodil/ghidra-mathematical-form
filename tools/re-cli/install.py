@@ -46,7 +46,7 @@ def install(prefix, repo):
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    for name in ('re_cli.py', 'inventory.py', 'full_recovery.py', 'recovery_build.py', 'source_project.py', 'bin/re-'):
+    for name in ('re_cli.py', 'inventory.py', 'full_recovery.py', 'recovery_build.py', 'source_project.py', 'global_state.py', 'bin/re-'):
         copy(HERE / name, name)
     native = Path('backend/research/graph_fibers/cpp')
     for name in binaries:

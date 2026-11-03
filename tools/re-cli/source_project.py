@@ -6,6 +6,7 @@ than replaced with stubs. Final acceptance requires a complete binary rebuild.
 """
 from pathlib import Path
 import re
+import global_state
 
 NONCODE = re.compile(r'/\*[\s\S]*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 WORD = re.compile(r'\b[A-Za-z_][A-Za-z_0-9]*\b')
@@ -261,15 +262,16 @@ def assemble(binary_report):
         aliases.extend([f'typedef {ctype(width, True)} int{width};',
                         f'typedef {ctype(width)} uint{width}, undefined{width}, xunknown{width};'])
     header = '\n'.join(aliases + implementations + [slice_helpers(w) for w in sorted(slice_widths)] + ['#endif', ''])
+    globals_source, global_metadata = global_state.recover(base, binary_report.get('functions', []), definitions)
     # Avoid accepting implicit int-return declarations for cross-function calls.
-    program = '#include "recovered_support.h"\n\n' + '\n'.join(prototypes) + '\n\n' + source
+    program = '#include "recovered_support.h"\n\n' + '\n'.join(prototypes) + '\n\n' + globals_source + '\n\n' + source
     metadata = dict(function_count=len(bodies), missing_functions=missing,
                     unresolved_callees=sorted(calls - set(definitions)),
                     helper_implementations=[name for name in required if name not in unsupported],
                     unsupported_helpers=unsupported,
                     unparsed_signatures=[address for address, _ in bodies if address not in definitions],
                     renamed_identifiers=renames, storage_lowering=storage,
-                    slice_widths=sorted(slice_widths), semantic_equivalence_proved=False)
+                    slice_widths=sorted(slice_widths), global_state=global_metadata, semantic_equivalence_proved=False)
     spec = dict(origin='whole-program decompiler proposal with integer operation lowering',
                 files={'program.c': program, 'recovered_support.h': header}, holes={},
                 profiles=[dict(compiler='gcc', flags=['-O2'], sources=['program.c'])])

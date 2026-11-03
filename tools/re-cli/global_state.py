@@ -1,0 +1,266 @@
+"""Recover initialized non-executable data from native symbol evidence.
+
+No declarations are guessed from identifier spelling. Relocations, conflicting
+views and unavailable bytes remain explicit obligations. Overlapping supported
+objects share one storage union instead of independent variables.
+"""
+import json
+from bisect import bisect_right
+import math
+from pathlib import Path
+import re
+import struct
+
+MAX_OBJECT = 1024 * 1024
+MAX_TOTAL = 16 * 1024 * 1024
+NAME = re.compile(r'[A-Za-z_][A-Za-z_0-9]*')
+INTEGER_TYPES = {'byte':1, 'char':1, 'uchar':1, 'short':2, 'ushort':2,
+                 'int':4, 'uint':4, 'long':8, 'ulong':8, 'longlong':8, 'ulonglong':8}
+for _width in (1,2,4,8,16):
+    for _prefix in ('int', 'uint', 'undefined', 'xunknown'):
+        INTEGER_TYPES[f'{_prefix}{_width}'] = _width
+INTEGER_TYPES['undefined'] = 1
+FLOAT_TYPES = {'float':4, 'double':8, 'float4':4, 'float8':8}
+
+
+def declaration_shape(record):
+    """Accept one simple declaration, preserving its native-inferred width."""
+    name = record.get('name')
+    if not isinstance(name, str) or not NAME.fullmatch(name):
+        return None
+    declaration = record.get('declaration', '').strip()
+    match = re.fullmatch(r'(const\s+)?([A-Za-z_][A-Za-z_0-9]*)\s*(\*\s*)?\b' +
+                         re.escape(name) + r'\s*(?:\[\s*(\d+)\s*\])?\s*;', declaration)
+    if not match:
+        return None
+    qualifier, ctype, pointer, count = match.groups()
+    count = int(count) if count else None
+    width = 8 if pointer else INTEGER_TYPES.get(ctype, FLOAT_TYPES.get(ctype, 1 if ctype == 'bool' else None))
+    if width is None or count == 0 or (count or 1) * width != record['size']:
+        return None
+    return dict(ctype=(qualifier or '') + ctype + (' *' if pointer else ''),
+                base_type=ctype, pointer=bool(pointer), count=count, width=width)
+
+
+def number(value, ctype, width):
+    if width <= 8:
+        return f'({ctype})0x{value:x}ULL'
+    return f'({ctype})(((uint16)0x{value >> 64:x}ULL << 64) | (uint16)0x{value & ((1 << 64)-1):x}ULL)'
+
+
+def initializer(record, shape):
+    raw = bytes.fromhex(record['initial_hex'])
+    values = []
+    for offset in range(0, len(raw), shape['width']):
+        chunk = raw[offset:offset + shape['width']]
+        value = int.from_bytes(chunk, 'little')
+        if shape['pointer']:
+            if value:
+                return None, 'pointer_requires_reference'
+            values.append('0')
+        elif shape['base_type'] == 'bool':
+            if value not in (0,1):
+                return None, 'noncanonical_boolean'
+            values.append('true' if value else 'false')
+        elif shape['base_type'] in FLOAT_TYPES:
+            floating = struct.unpack('<f' if len(chunk)==4 else '<d', chunk)[0]
+            if not math.isfinite(floating):
+                return None, 'nonfinite_float_payload'
+            values.append(floating.hex() + ('f' if len(chunk)==4 else ''))
+        else:
+            values.append(number(value, shape['ctype'], shape['width']))
+    return ('{' + ', '.join(values) + '}' if shape['count'] is not None else values[0]), None
+
+
+def recover(base, rows, functions=None):
+    functions = functions or {}
+    records, obligations, metadata_missing = {}, [], []
+    consumed = 0
+    for row in rows:
+        path = Path(base) / 'functions' / f'{row["address"]:x}' / 'globals.json'
+        if not path.is_file():
+            metadata_missing.append(row['address'])
+            continue
+        try:
+            if path.stat().st_size > MAX_TOTAL * 3:
+                raise ValueError('metadata_size_limit')
+            data = json.loads(path.read_text())
+            if data.get('version') not in (1,2) or not isinstance(data.get('globals'), list):
+                raise ValueError('unsupported_metadata')
+            for original in data['globals']:
+                record = dict(original)
+                name, address, size = record.get('name'), record.get('address'), record.get('size')
+                if (not isinstance(name,str) or type(address) is not int or type(size) is not int or
+                        address < 0 or size < 1 or size > MAX_OBJECT or address + size > 2**64):
+                    raise ValueError('invalid_global_extent')
+                if record.get('initial_status') == 'known':
+                    raw = record.get('initial_hex')
+                    if not isinstance(raw,str) or len(raw) != size*2 or re.fullmatch('[0-9a-fA-F]+',raw) is None:
+                        raise ValueError('invalid_initial_bytes')
+                    record['initial_hex'] = raw.lower()
+                record['declaration'] = ' '.join(record.get('declaration','').split())
+                record.setdefault('pointer_target', None)
+                record.setdefault('pointer_target_is_code', False)
+                if type(record['pointer_target_is_code']) is not bool:
+                    raise ValueError('invalid_pointer_target_kind')
+                target = record['pointer_target']
+                if target is not None and (type(target) is not int or not 0 <= target < 2**64):
+                    raise ValueError('invalid_pointer_target')
+                if target is not None and record.get('initial_status') == 'known' and (
+                        size != 8 or int.from_bytes(bytes.fromhex(record['initial_hex']), 'little') != target):
+                    raise ValueError('pointer_target_disagrees_with_bytes')
+                record.pop('type_name', None)
+                previous = records.get(name)
+                if previous is not None:
+                    ignored = {'pointer_target', 'pointer_target_is_code', 'conflict'}
+                    same = {k:v for k,v in previous.items() if k not in ignored} == {k:v for k,v in record.items() if k not in ignored}
+                    targets = (previous.get('pointer_target'), target)
+                    compatible = targets[0] is None or targets[1] is None or targets[0] == targets[1]
+                    if targets[0] is not None and targets[1] is not None:
+                        compatible = compatible and previous['pointer_target_is_code'] == record['pointer_target_is_code']
+                    if not same or not compatible:
+                        if not previous.get('conflict'):
+                            obligations.append(dict(name=name, reason='inconsistent_global_views'))
+                        previous['conflict'] = True
+                    elif target is not None:
+                        previous['pointer_target'] = target
+                        previous['pointer_target_is_code'] = record['pointer_target_is_code']
+                elif previous is None:
+                    consumed += size
+                    if consumed > MAX_TOTAL:
+                        obligations.append(dict(name=name, reason='global_byte_budget'))
+                        continue
+                    records[name] = record
+        except (OSError, ValueError, TypeError, AttributeError) as error:
+            obligations.append(dict(function=row['address'], reason='invalid_global_metadata', detail=str(error)))
+    accepted, relocated = [], {}
+    blocked = set()
+    for name, record in records.items():
+        reason = record.get('initial_status', 'missing_initial_state') if record.get('initial_status') != 'known' else None
+        if record.get('conflict'):
+            reason = 'inconsistent_global_views'
+        shape = declaration_shape(record)
+        if shape is None:
+            reason = reason or 'unsupported_global_declaration'
+        value = None
+        if (reason in (None, 'relocation_requires_resolution') and shape is not None and
+                shape['count'] is None and shape['width'] == 8 and record['pointer_target'] is not None and
+                (shape['pointer'] or shape['base_type'] in INTEGER_TYPES) and not record.get('conflict')):
+            relocated[name] = record['pointer_target']
+            reason = None
+            value = ''
+        if reason is None:
+            if name not in relocated:
+                value, reason = initializer(record, shape)
+        if reason:
+            blocked.add(name)
+            obligations.append(dict(name=name, address=record['address'], reason=reason))
+        else:
+            accepted.append(dict(record=record, shape=shape, value=value))
+    # An unresolved overlapping view cannot safely be split off from a known one.
+    components = []
+    for record in sorted(records.values(), key=lambda r:(r['address'],r['size'])):
+        if not components or record['address'] >= components[-1]['end']:
+            components.append(dict(end=record['address']+record['size'], names=[record['name']]))
+        else:
+            components[-1]['end'] = max(components[-1]['end'],record['address']+record['size'])
+            components[-1]['names'].append(record['name'])
+    for component in components:
+        if len(component['names']) > 1 and any(name in relocated for name in component['names']):
+            for name in component['names']:
+                blocked.add(name)
+                obligations.append(dict(name=name, reason='relocated_overlap_requires_resolution'))
+        if any(name in blocked for name in component['names']):
+            for name in component['names']:
+                if name not in blocked:
+                    blocked.add(name)
+                    obligations.append(dict(name=name, reason='overlaps_unresolved_global'))
+    accepted = [item for item in accepted if item['record']['name'] not in blocked]
+    pointer_items = [item for item in accepted if item['record']['name'] in relocated]
+    accepted = [item for item in accepted if item['record']['name'] not in relocated]
+    accepted.sort(key=lambda item:(item['record']['address'], item['record']['name']))
+    groups = []
+    for item in accepted:
+        r = item['record']
+        if not groups or r['address'] >= groups[-1]['end']:
+            groups.append(dict(start=r['address'],end=r['address']+r['size'],items=[item]))
+        else:
+            groups[-1]['end'] = max(groups[-1]['end'],r['address']+r['size'])
+            groups[-1]['items'].append(item)
+    declarations, exported = [], []
+    for index, group in enumerate(groups):
+        if len(group['items']) == 1:
+            item=group['items'][0];record=item['record']
+            declarations.append(record['declaration'].rstrip(';') + ' = ' + item['value'] + ';')
+            exported.append(record['name'])
+            continue
+        size=group['end']-group['start']
+        raw=bytearray(size);known=bytearray(size);fields=[];aliases=[];conflict=False
+        for view,item in enumerate(group['items']):
+            r,shape=item['record'],item['shape']
+            offset=r['address']-group['start'];content=bytes.fromhex(r['initial_hex'])
+            for byte,value in enumerate(content,offset):
+                if known[byte] and raw[byte]!=value:
+                    conflict=True
+                raw[byte]=value;known[byte]=1
+            pad=f'unsigned char pad[{offset}]; ' if offset else ''
+            suffix=f'[{shape["count"]}]' if shape['count'] is not None else ''
+            fields.append(f'  struct __attribute__((packed)) {{ {pad}{shape["ctype"]} value{suffix}; }} view{view};')
+            aliases.append(f'#define {r["name"]} (__recovery_data_{index}.view{view}.value)')
+        if conflict or not all(known):
+            obligations.extend(dict(name=item['record']['name'],reason='conflicting_overlap_bytes') for item in group['items'])
+            continue
+        # GNU C union views explicitly preserve aliases and partial overlaps.
+        declarations.append('static union {\n'+f'  unsigned char raw[{size}];\n'+'\n'.join(fields)+
+                            f'\n}} __recovery_data_{index} = {{ .raw = {{'+','.join(f'0x{b:02x}' for b in raw)+'} };')
+        declarations.extend(aliases)
+        exported.extend(item['record']['name'] for item in group['items'])
+    # Emit initialized pointer references after data storage and aliases exist.
+    # Forward declarations permit mutually referring pointer objects.
+    pointer_names = {item['record']['name'] for item in pointer_items}
+    available_names = set(exported) | pointer_names
+    address_objects = sorted((r for r in records.values() if r['name'] in available_names),
+                             key=lambda r:(r['address'],r['name']))
+    starts, max_ends = [], []
+    for record in address_objects:
+        starts.append(record['address'])
+        max_ends.append(max(max_ends[-1] if max_ends else 0,record['address']+record['size']))
+    references = {}
+    for item in pointer_items:
+        record,shape=item['record'],item['shape'];target=record['pointer_target'];name=record['name']
+        if record['pointer_target_is_code']:
+            destination=functions.get(target)
+            if destination:
+                references[name] = dict(value=f'({shape["ctype"]})&{destination}', dependency=None)
+        else:
+            possible=[];position=bisect_right(starts,target)-1
+            while position>=0 and max_ends[position]>target:
+                other=address_objects[position]
+                if target < other['address']+other['size']:
+                    possible.append(other)
+                position-=1
+            if possible:
+                other=min(possible,key=lambda r:(r['size'],r['name']))
+                offset=target-other['address']
+                references[name] = dict(value=f'({shape["ctype"]})((unsigned char *)&{other["name"]} + {offset})',
+                                        dependency=other['name'])
+        if name not in references:
+            blocked.add(name)
+            obligations.append(dict(name=name,reason='relocation_target_not_recovered',target=target))
+    changed=True
+    while changed:
+        changed=False
+        for name,reference in references.items():
+            if name not in blocked and reference['dependency'] in blocked:
+                blocked.add(name);changed=True
+                obligations.append(dict(name=name,reason='relocation_dependency_unresolved'))
+    declarations.extend('extern '+item['record']['declaration'] for item in pointer_items
+                        if item['record']['name'] not in blocked)
+    for item in pointer_items:
+        record=item['record'];name=record['name']
+        if name in blocked:
+            continue
+        declarations.append(record['declaration'].rstrip(';')+' = '+references[name]['value']+';')
+        exported.append(name)
+    return '\n'.join(declarations), dict(exported_globals=exported, obligations=obligations,
+        functions_without_metadata=metadata_missing, source_global_equivalence_proved=False)
