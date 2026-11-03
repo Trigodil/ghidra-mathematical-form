@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import sys
+import source_project
 
 HERE = Path(__file__).resolve().parent
 TOKEN = re.compile(r'@@([A-Za-z_][A-Za-z_0-9]*)@@')
@@ -151,27 +152,11 @@ def compare_files(target, rebuilt):
 
 
 def decompiler_project(binary_report):
-    """Keep all emitted functions in the proposal, without inventing bodies."""
+    """Assemble all bodies, call declarations and fixed-width helpers."""
+    spec, metadata = source_project.assemble(binary_report)
     base = Path(binary_report['output'])
-    texts, missing = [], []
-    for row in binary_report.get('functions', []):
-        source = base / 'functions' / f'{row["address"]:x}' / 'decompiled.c'
-        if source.is_file():
-            texts.append(source.read_text(errors='replace'))
-        else:
-            missing.append(row['address'])
-    if not texts:
-        return None, missing
-    # These are type spelling adapters, not a claim that recovered types are correct.
-    aliases = ['#include <stdint.h>', '#include <stdbool.h>', 'typedef unsigned char byte;',
-               'typedef unsigned int uint;', 'typedef unsigned long ulong;', 'typedef void code(void);']
-    for width in (1, 2, 4, 8):
-        aliases.extend([f'typedef int{width * 8}_t int{width};',
-                        f'typedef uint{width * 8}_t uint{width}, undefined{width}, xunknown{width};'])
-    aliases.append('typedef uint8_t undefined;')
-    return dict(origin='all decompiler outputs; unverified proposal',
-                files={'program.c': '\n'.join(aliases + texts)}, holes={},
-                profiles=[dict(compiler='gcc', flags=['-O2'], sources=['program.c'])]), missing
+    write_json(base / 'source-assembly.json', metadata)
+    return spec, metadata['missing_functions']
 
 
 def recover(target, spec, folder, run, emit, timeout=60, memory=2048, max_candidates=64):

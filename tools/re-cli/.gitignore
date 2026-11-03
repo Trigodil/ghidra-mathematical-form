@@ -1,3 +1,6 @@
 # This bin directory contains the source launcher, not generated binaries.
 !bin/
 !bin/re-
+# Local validation and target-specific notes are not distributed.
+/tests/
+/FULL_RECOVERY.md

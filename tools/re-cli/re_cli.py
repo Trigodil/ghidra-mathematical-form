@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import full_recovery
+import source_project
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_REPO = HERE / 'backend' if (HERE / 'backend').is_dir() else HERE.parents[1]
@@ -250,6 +251,7 @@ class Workflow:
         fingerprint = hashlib.sha256()
         for source in sorted([*sources, *self.tools.values(), HERE / 're_cli.py', HERE / 'inventory.py',
                               HERE / 'full_recovery.py', HERE / 'recovery_build.py',
+                              HERE / 'source_project.py',
                               Path('/usr/bin/objdump')]):
             fingerprint.update(str(source).encode())
             fingerprint.update(bytes.fromhex(digest(source)))
@@ -498,6 +500,7 @@ class Workflow:
         spec = self.recovery_specs.get(key)
         missing = []
         if spec is None:
+            result = self.complete_source_dependencies(source, result)
             spec, missing = full_recovery.decompiler_project(result)
         result['analysis_status'] = result.get('analysis_status', result['status'])
         if spec is None:
@@ -514,6 +517,98 @@ class Workflow:
                             'failed' if result['analysis_status'] == 'failed' else 'partial')
         emit(f'[full recovery] {source.name}: {result["full_recovery"]["status"]}')
         save(Path(result['output']) / 'report.json', result)
+        return result
+
+    def complete_source_dependencies(self, source, result):
+        """Extend all source proposals to a direct-callee fixed point.
+
+        Pseudocode address references are discovery hypotheses. The native
+        loader validates each entry and no statement of flow completeness is
+        inferred from an empty frontier. Dynamic targets remain unresolved.
+        """
+        folder = Path(result['output'])
+        rows = result.setdefault('functions', [])
+        known = {row['address']: row for row in rows}
+        pending, examined, attempted = set(), set(), set()
+        deadline = time.monotonic() + self.args.stage_timeout
+        state = dict(status='running', attempts=0, new_functions=0,
+                     flow_completeness_proved=False, pending=[], failed=[])
+        for row in rows:
+            if not (folder / 'functions' / f'{row["address"]:x}' / 'decompiled.c').is_file():
+                state['failed'].append(row['address'])
+                if self.args.fresh:
+                    pending.add(row['address'])
+
+        def scan_row(row):
+            address = row['address']
+            if address in examined:
+                return
+            examined.add(address)
+            path = folder / 'functions' / f'{address:x}' / 'decompiled.c'
+            if path.is_file():
+                for target_address in source_project.call_addresses(path.read_text(errors='replace')):
+                    if target_address not in known and target_address not in attempted:
+                        pending.add(target_address)
+        for row in rows:
+            scan_row(row)
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or state['attempts'] >= self.args.recovery_functions or STOP.is_set():
+                state['status'] = 'interrupted' if STOP.is_set() else 'budget_exhausted'
+                break
+            address = min(pending)
+            pending.remove(address)
+            attempted.add(address)
+            state['attempts'] += 1
+            out = folder / 'functions' / f'{address:x}'
+            out.mkdir(parents=True, exist_ok=True)
+            (out / 'decompiled.c').unlink(missing_ok=True)
+            row = dict(address=address, name=f'__recovered_{address:x}', size=0,
+                       selector=f'@0x{address:x}', provenance=['pseudocode_call_candidate'])
+            row['decompile'] = self.restricted([self.tools['core-decompile'], source, self.specs,
+                row['selector'], out], source, out, min(remaining, self.args.function_timeout),
+                label=f'recover callee 0x{address:x}')
+            row['status'] = row['decompile']['status']
+            text_path = out / 'decompiled.c'
+            if row['status'] == 'ok' and not text_path.is_file():
+                row['status'] = 'missing_pseudocode'
+            if text_path.is_file():
+                row['warnings'] = [line.strip() for line in text_path.read_text(errors='replace').splitlines()
+                                   if 'WARNING:' in line]
+                quality = out / 'quality.tsv'
+                if quality.is_file():
+                    flags = dict(line.split('\t') for line in quality.read_text().splitlines())
+                    row['unknown_relocation_read'] = flags.get('unknown_relocation_read') != '0'
+                    if flags.get('unimplemented') == '1' or flags.get('bad_data') == '1' or row['warnings']:
+                        if row['status'] == 'ok':
+                            row['status'] = 'partial'
+                state['new_functions'] += 1
+            if address in known:
+                previous = known[address]
+                previous.clear()
+                previous.update(row)
+                row = previous
+            else:
+                rows.append(row)
+            known[address] = row
+            if address in state['failed']:
+                state['failed'].remove(address)
+            if row['status'] not in ('ok', 'partial'):
+                state['failed'].append(address)
+            examined.discard(address)
+            scan_row(row)
+            save(out / 'result.json', row)
+            state['pending'] = sorted(pending)
+            save(folder / 'source-dependencies.json', state)
+        else:
+            state['status'] = 'unresolved' if state['failed'] else 'direct_callee_fixed_point'
+        state['pending'] = sorted(pending)
+        result['source_dependencies'] = state
+        result['functions'] = sorted(rows, key=lambda row: row['address'])
+        result['functions_discovered'] = len(rows)
+        result['pseudocode_emitted'] = sum((folder / 'functions' / f'{row["address"]:x}' / 'decompiled.c').is_file() for row in rows)
+        save(folder / 'source-dependencies.json', state)
+        save(folder / 'report.json', result)
         return result
 
     def import_analysis(self, source):
@@ -617,9 +712,11 @@ def main(argv=None):
     parser.add_argument('--recovery-spec', type=Path, help='Whole-project source grammar and compiler profiles (JSON)')
     parser.add_argument('--reuse-analysis', type=Path, help='Reuse a hash-matching analysis report for whole-project recovery')
     parser.add_argument('--recovery-candidates', type=int, default=64, help='Whole-project build budget per binary (default: 64)')
+    parser.add_argument('--recovery-functions', type=int, default=100000,
+                        help='Missing-callee discovery budget; --stage-timeout bounds the whole stage')
     parser.add_argument('--version', action='version', version=VERSION)
     args = parser.parse_args(argv)
-    if (args.jobs < 1 or args.cpu_seconds < 1 or args.memory_mb < 128 or args.recovery_candidates < 1
+    if (args.jobs < 1 or args.cpu_seconds < 1 or args.memory_mb < 128 or args.recovery_candidates < 1 or args.recovery_functions < 1
             or not math.isfinite(args.function_timeout) or args.function_timeout <= 0
             or not math.isfinite(args.stage_timeout) or args.stage_timeout <= 0):
         parser.error('Jobs/CPU/timeouts must be positive and memory must be at least 128 MiB')
