@@ -14,10 +14,11 @@ import subprocess
 import sys
 import threading
 import time
+import full_recovery
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_REPO = HERE / 'backend' if (HERE / 'backend').is_dir() else HERE.parents[1]
-VERSION = '0.1.3'
+VERSION = '0.2.0'
 CHILDREN = set()
 CHILD_LOCK = threading.Lock()
 STOP = threading.Event()
@@ -212,6 +213,23 @@ class Workflow:
         self.repo = args.repo.resolve()
         self.backend = self.repo / 'research/graph_fibers/cpp'
         self.output = args.output.resolve()
+        self.recovery_specs = {}
+        self.previous_analysis = {}
+        if args.reuse_analysis:
+            self.previous_analysis_hash = digest(args.reuse_analysis)
+            previous = json.loads(args.reuse_analysis.read_text())
+            entries = previous.get('binaries', [previous])
+            for entry in entries:
+                if 'path' in entry and 'sha256' in entry and 'output' in entry:
+                    self.previous_analysis[str(Path(entry['path']).resolve())] = entry
+        if args.recovery_spec:
+            config = json.loads(args.recovery_spec.read_text())
+            if not isinstance(config, dict) or config.get('version') != 1 or not isinstance(config.get('targets'), dict):
+                raise ValueError('Recovery specification requires version 1 and a targets map')
+            for name, spec in config['targets'].items():
+                full_recovery.relative_name(name)
+                full_recovery.validate(spec)
+            self.recovery_specs = config['targets']
         if within(self.output, self.repo):
             raise ValueError('Output must be outside the checkout')
         # Fail early instead of implicitly building/writing into the checkout.
@@ -231,6 +249,7 @@ class Workflow:
             raise ValueError('Missing x86 language specifications')
         fingerprint = hashlib.sha256()
         for source in sorted([*sources, *self.tools.values(), HERE / 're_cli.py', HERE / 'inventory.py',
+                              HERE / 'full_recovery.py', HERE / 'recovery_build.py',
                               Path('/usr/bin/objdump')]):
             fingerprint.update(str(source).encode())
             fingerprint.update(bytes.fromhex(digest(source)))
@@ -472,6 +491,59 @@ class Workflow:
         save(folder / 'report.json', result)
         return result
 
+    def recover_source(self, source, result, target):
+        if digest(source) != result['sha256']:
+            raise ValueError('Target changed since analysis; refusing stale recovery input')
+        key = source.name if target.is_file() else source.relative_to(target).as_posix()
+        spec = self.recovery_specs.get(key)
+        missing = []
+        if spec is None:
+            spec, missing = full_recovery.decompiler_project(result)
+        result['analysis_status'] = result.get('analysis_status', result['status'])
+        if spec is None:
+            result['full_recovery'] = dict(status='no_source_candidate',
+                whole_binary_recovered=False, missing_functions=missing)
+        else:
+            result['full_recovery'] = full_recovery.recover(
+                source, spec, Path(result['output']) / 'full-recovery', run, emit,
+                timeout=self.args.function_timeout, memory=self.args.memory_mb,
+                max_candidates=self.args.recovery_candidates)
+            result['full_recovery']['missing_decompiler_functions'] = missing
+        result['whole_binary_recovered'] = result['full_recovery']['whole_binary_recovered']
+        result['status'] = ('ok' if result['whole_binary_recovered'] else
+                            'failed' if result['analysis_status'] == 'failed' else 'partial')
+        emit(f'[full recovery] {source.name}: {result["full_recovery"]["status"]}')
+        save(Path(result['output']) / 'report.json', result)
+        return result
+
+    def import_analysis(self, source):
+        previous = self.previous_analysis.get(str(source))
+        if previous is None or digest(source) != previous['sha256']:
+            raise ValueError('No hash-matching analysis for target in --reuse-analysis report')
+        result = json.loads(json.dumps(previous))
+        key = hashlib.sha256(str(source).encode()).hexdigest()[:16]
+        folder = self.output / 'binaries' / key / 'imported-analysis'
+        folder.mkdir(parents=True, exist_ok=True)
+        origin = Path(previous['output'])
+        for row in result.get('functions', []):
+            address = row['address']
+            if type(address) is not int or not 0 <= address < 2**64:
+                raise ValueError('Invalid function address in analysis report')
+            source_file = origin / 'functions' / f'{address:x}' / 'decompiled.c'
+            destination = folder / 'functions' / f'{address:x}' / 'decompiled.c'
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source_file.resolve() == destination.resolve():
+                continue
+            destination.unlink(missing_ok=True)
+            if source_file.is_file():
+                shutil.copyfile(source_file, destination)
+        result.update(output=str(folder), whole_binary_recovered=False,
+                      imported_analysis=str(self.args.reuse_analysis.resolve()),
+                      imported_analysis_sha256=self.previous_analysis_hash, target_unchanged=True)
+        result.pop('full_recovery', None)
+        emit(f'[analysis] reused {len(result.get("functions", []))} function proposals for hash-matching target')
+        return result
+
 
 def print_summary(report, elapsed):
     binaries = report['binaries']
@@ -519,6 +591,8 @@ def print_summary(report, elapsed):
     emit(f'Pseudocode files: {emitted} | Resumed functions: {resumed} | '
          f'Skipped files/directories: {len(report["skipped"])} | Elapsed: {elapsed:.2f}s')
     emit('Function totals cover named and discovered entry candidates; other code may remain undiscovered.')
+    emit(f'Whole binaries rebuilt exactly: {sum(bool(b.get("whole_binary_recovered")) for b in binaries)}/{len(binaries)}')
+    emit('Full source recovery requires a complete project rebuild matching every target byte; pseudocode counts do not establish recovery.')
 
 
 def main(argv=None):
@@ -540,9 +614,12 @@ def main(argv=None):
     parser.add_argument('--memory-mb', type=int, default=2048, help='Per-worker memory ceiling')
     parser.add_argument('--symbolic', action='store_true', help='Also attempt generic GPR/RAM symbolic lifting')
     parser.add_argument('--fresh', action='store_true', help='Retry functions instead of resuming successful work')
+    parser.add_argument('--recovery-spec', type=Path, help='Whole-project source grammar and compiler profiles (JSON)')
+    parser.add_argument('--reuse-analysis', type=Path, help='Reuse a hash-matching analysis report for whole-project recovery')
+    parser.add_argument('--recovery-candidates', type=int, default=64, help='Whole-project build budget per binary (default: 64)')
     parser.add_argument('--version', action='version', version=VERSION)
     args = parser.parse_args(argv)
-    if (args.jobs < 1 or args.cpu_seconds < 1 or args.memory_mb < 128
+    if (args.jobs < 1 or args.cpu_seconds < 1 or args.memory_mb < 128 or args.recovery_candidates < 1
             or not math.isfinite(args.function_timeout) or args.function_timeout <= 0
             or not math.isfinite(args.stage_timeout) or args.stage_timeout <= 0):
         parser.error('Jobs/CPU/timeouts must be positive and memory must be at least 128 MiB')
@@ -570,6 +647,9 @@ def main(argv=None):
                 raise ValueError('Another re- process is already writing to this output')
             workflow.prepare()
             paths, skipped = scan(target, workflow.output)
+            keys = {p.name if target.is_file() else p.relative_to(target).as_posix() for p in paths}
+            if set(workflow.recovery_specs) - keys:
+                raise ValueError('Recovery specification contains targets not present in this scan')
             report = dict(input=str(target), version=VERSION, binaries=[], skipped=skipped,
                           target_executed=False, whole_application_recovered=False, status='running')
             save(workflow.output / 'report.json', report)
@@ -578,7 +658,9 @@ def main(argv=None):
                 emit(f'[skipped] {item["path"]}: {item["reason"]}')
             for source in paths:
                 try:
-                    result = workflow.analyze(source)
+                    result = workflow.import_analysis(source) if args.reuse_analysis else workflow.analyze(source)
+                    if 'output' in result:
+                        result = workflow.recover_source(source, result, target)
                 except (OSError, ValueError) as error:
                     result = dict(path=str(source), status='failed', error=str(error))
                     emit(f'[error] {source}: {error}')
@@ -586,6 +668,14 @@ def main(argv=None):
                 save(workflow.output / 'report.json', report)
             report['status'] = 'partial' if (not paths or skipped or any(
                 row['status'] != 'ok' for row in report['binaries'])) else 'ok'
+            report['whole_binary_set_recovered'] = bool(paths) and all(
+                row.get('whole_binary_recovered', False) for row in report['binaries'])
+            # A directory may also require resources, scripts and dependency sources.
+            # Matching its scanned ELFs alone must never certify that application.
+            report['whole_application_recovered'] = target.is_file() and report['whole_binary_set_recovered']
+            report['recovery_scope'] = 'single ELF artifact' if target.is_file() else 'scanned ELF artifacts; application resources and external dependency sources unresolved'
+            if not report['whole_application_recovered']:
+                report['status'] = 'partial'
             save(workflow.output / 'report.json', report)
             print_summary(report, time.monotonic() - started)
             emit(f'[{report["status"]}] Report: {workflow.output / "report.json"}')
