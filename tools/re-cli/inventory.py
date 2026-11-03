@@ -200,7 +200,7 @@ def inventory(path):
                 total += max(0, right - max(left, end))
                 end = max(end, right)
             return total
-        return dict(functions=functions, bun=bun, executable_bytes=union_bytes(segments),
+        return dict(functions=functions, bun=bun, has_relocations=any(s[1] in (4, 9, 19) and s[5] for s in sections), executable_bytes=union_bytes(segments),
                     named_code_bytes=union_bytes(covered), ambiguous_names=sorted(ambiguous),
                     discovery=dict(elf_entry=sum('elf_entry' in p for p in candidates.values()),
                                    eh_frame_hdr=sum('eh_frame_hdr' in p for p in candidates.values()),

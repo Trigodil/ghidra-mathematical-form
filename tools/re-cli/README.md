@@ -46,6 +46,18 @@ Exit codes are 0 for completed supported work, 1 for an error, 2 for partial or
 unsupported results, and 130 for interruption. Pseudocode is heuristic and is
 not an equivalence proof or recovery of the original source text.
 
+The native recovery manifest links to `recursive-discovery/sites.tsv` and
+`coverage.tsv`. The former records unresolved raw indirect transfers, decode
+errors and queued work at the instruction limit; the latter gives decoded and
+unexamined executable-byte ranges. Decoding does not prove that bytes are code,
+that a function is complete, or that its pseudocode is equivalent. The pipeline
+iterates decompiler-resolved calls and switch targets where safe; switch targets
+are flow seeds, not function entries. The loader applies x86-64 RELATIVE
+relocations at link-time virtual addresses and withholds inferred edges for
+functions that read unsupported relocations. Budgets and unexamined ranges identify unfinished analysis, not
+proof that recovery is impossible. Function reports include decompiler warnings
+and failed or partial results, and completed pseudocode can be resumed.
+
 ## Building the native backend
 
 Installation requires prepared analyzers. To build them from this checkout:

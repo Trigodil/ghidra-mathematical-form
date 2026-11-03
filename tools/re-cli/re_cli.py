@@ -17,7 +17,7 @@ import time
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_REPO = HERE / 'backend' if (HERE / 'backend').is_dir() else HERE.parents[1]
-VERSION = '0.1.2'
+VERSION = '0.1.3'
 CHILDREN = set()
 CHILD_LOCK = threading.Lock()
 STOP = threading.Event()
@@ -331,7 +331,9 @@ class Workflow:
             checkpoint = out / 'result.json'
             if checkpoint.exists() and not self.args.fresh:
                 row = json.loads(checkpoint.read_text())
-                if (row.get('fingerprint') == fingerprint and row.get('status') == 'ok'
+                if (row.get('fingerprint') == fingerprint and row.get('status') in ('ok', 'partial')
+                        and row.get('decompile', {}).get('status') == 'ok'
+                        and (not self.args.symbolic or row.get('symbolic', {}).get('status') in ('ok', 'unsupported'))
                         and (out / 'decompiled.c').is_file()):
                     row['resumed'] = True
                     emit(f'[function {item["name"]} @ 0x{item["address"]:x}] resumed successful result')
@@ -342,6 +344,20 @@ class Workflow:
                                                 item.get('selector', item['name']), out], source, out,
                                                 label=f'decompile {item["name"]} @ 0x{item["address"]:x}')
             row['status'] = row['decompile']['status']
+            quality = out / 'quality.tsv'
+            if row['status'] == 'ok' and quality.is_file():
+                flags = dict(line.split('\t') for line in quality.read_text().splitlines())
+                row['unimplemented_instructions'] = flags.get('unimplemented') == '1'
+                row['bad_data'] = flags.get('bad_data') == '1'
+                row['unknown_relocation_read'] = flags.get('unknown_relocation_read') != '0'
+                if row['unimplemented_instructions'] or row['bad_data']:
+                    row['status'] = 'partial'
+            pseudocode = out / 'decompiled.c'
+            if pseudocode.is_file():
+                row['warnings'] = [line.strip() for line in pseudocode.read_text(errors='replace').splitlines()
+                                   if 'WARNING:' in line]
+                if row['warnings'] and row['status'] == 'ok':
+                    row['status'] = 'partial'
             if row['status'] == 'ok' and not (out / 'decompiled.c').is_file():
                 row['status'] = 'missing_pseudocode'
             if self.args.symbolic:
@@ -361,22 +377,80 @@ class Workflow:
             return row
 
         rows = []
-        pool = ThreadPoolExecutor(max_workers=self.args.jobs)
-        progress = FunctionProgress(len(tasks))
-        progress.start()
-        try:
-            # Bound queued work as well as active processes for very large inputs.
-            for offset in range(0, len(tasks), self.args.jobs * 4):
-                futures = [pool.submit(work, item) for item in tasks[offset:offset + self.args.jobs * 4]]
-                for future in as_completed(futures):
-                    rows.append(future.result())
-                    progress.update(rows[-1])
-        except BaseException:
-            stop_children()
-            raise
-        finally:
-            pool.shutdown(wait=True, cancel_futures=True)
-            progress.close()
+        done = set()
+        switch_seeds = set()
+        known = {row['address']: row for row in tasks}
+        rounds = 0
+        while True:
+            batch = [item for item in tasks if item['address'] not in done]
+            if not batch:
+                break
+            rounds += 1
+            pool = ThreadPoolExecutor(max_workers=self.args.jobs)
+            progress = FunctionProgress(len(batch))
+            progress.start()
+            round_rows = []
+            try:
+                for offset in range(0, len(batch), self.args.jobs * 4):
+                    futures = [pool.submit(work, item) for item in batch[offset:offset + self.args.jobs * 4]]
+                    for future in as_completed(futures):
+                        row = future.result()
+                        rows.append(row); round_rows.append(row); done.add(row['address'])
+                        progress.update(row)
+            except BaseException:
+                stop_children()
+                raise
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
+                progress.close()
+            new_seeds = set()
+            for row in round_rows:
+                edges = folder / 'functions' / f"{row['address']:x}" / 'recovered-edges.tsv'
+                if row.get('decompile', {}).get('status') != 'ok' or not edges.is_file():
+                    continue
+                for line in edges.read_text().splitlines()[1:]:
+                    kind, site_text, target_text = line.split('\t')
+                    site, target = int(site_text, 16), int(target_text, 16)
+                    # Unsupported relocation reads taint this function's inferred edges.
+                    # Supported x86-64 RELATIVE relocations are applied by the loader.
+                    if row.get('unknown_relocation_read', True):
+                        continue
+                    if kind == 'switch':
+                        if target not in switch_seeds:
+                            switch_seeds.add(target); new_seeds.add(target)
+                    elif kind in ('call', 'indirect_call') and target not in known:
+                        item = dict(address=target, name=f'sub_{target:x}', size=0,
+                                    file_backed_code=True, selector=f'@0x{target:x}',
+                                    provenance=['decompiler_' + kind], discovered_from=site)
+                        known[target] = item; tasks.append(item); new_seeds.add(target)
+            if new_seeds:
+                # Re-run traversal with all seeds so coverage remains cumulative.
+                (discovery / 'seeds.txt').write_text(''.join(f'{a:x}\n' for a in sorted(set(known) | switch_seeds)))
+                result['recursive_discovery'] = self.restricted([self.tools['native-discover'], source,
+                    self.specs / 'x86-64.sla', discovery / 'seeds.txt', discovery, '2000000'],
+                    source, discovery, self.args.stage_timeout)
+                if result['recursive_discovery']['status'] == 'ok':
+                    inventory['discovery']['recursive'] = json.loads((discovery / 'recursive-stats.json').read_text())
+                    for line in (discovery / 'recursive.tsv').read_text().splitlines()[1:]:
+                        address_text, caller_text = line.split('\t')
+                        address, caller = int(address_text, 16), int(caller_text, 16)
+                        if address not in known:
+                            item = dict(address=address, name=f'sub_{address:x}', size=0,
+                                        file_backed_code=True, selector=f'@0x{address:x}',
+                                        provenance=['direct_call'], discovered_from=caller)
+                            known[address] = item; tasks.append(item)
+                else:
+                    inventory['discovery']['warnings'].append('Iterative discovery stage failed or timed out')
+            tasks.sort(key=lambda item: (item['address'], item['name']))
+        if any(row.get('unknown_relocation_read', True) for row in rows):
+            inventory['discovery']['warnings'].append('Decompiler-inferred edges withheld for functions reading unsupported relocations or missing relocation analysis')
+        result['recovery_rounds'] = rounds
+        result['functions_discovered'] = len(tasks)
+        result['relocation_sensitive_edges_withheld'] = any(row.get('unknown_relocation_read', True) for row in rows)
+        result['recovery_manifest'] = dict(
+            failed_functions=[dict(address=row['address'], status=row['status']) for row in rows if row['status'] != 'ok'],
+            instruction_sites=str(discovery / 'sites.tsv'), byte_coverage=str(discovery / 'coverage.tsv'),
+            note='Unexamined ranges are not known to be code. Decoded bytes do not establish function boundaries or semantic correctness.')
         result['functions'] = sorted(rows, key=lambda row: row['address'])
         result['pseudocode_emitted'] = sum(row.get('decompile', {}).get('status') == 'ok' for row in rows)
         result['resumed_functions'] = sum(row.get('resumed', False) for row in rows)
@@ -386,9 +460,11 @@ class Workflow:
                       or result['assembly']['status'] != 'ok'
                       or result['decoder']['status'] != 'ok' or bool(inventory['ambiguous_names'])
                       or bool(inventory.get('discovery', {}).get('warnings'))
+                      or bool(inventory.get('discovery', {}).get('recursive', {}).get('unresolved_indirect_calls', 0))
+                      or bool(inventory.get('discovery', {}).get('recursive', {}).get('unresolved_indirect_branches', 0))
                       or result.get('bun_extraction', {}).get('status', 'ok') != 'ok')
         result['status'] = 'partial' if incomplete else 'ok'
-        result['limits'] = ['Recursive discovery follows direct calls and reachable branches within budgets; indirect transfers and tail calls remain unresolved, and unnamed function sizes are unknown.',
+        result['limits'] = ['Discovery combines direct traversal with decompiler-resolved calls and switch targets where relocation state permits; other indirect transfers and tail calls remain unresolved, and unnamed function sizes are unknown.',
                            'Executable-section assembly is linear disassembly, not recovered source or flow coverage.',
                            'Pseudocode is heuristic; original source and equivalence are not established.',
                            'External dependencies and files behind symlinks are outside this scan.',
