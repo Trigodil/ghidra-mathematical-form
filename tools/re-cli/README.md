@@ -1,8 +1,8 @@
 # Application reverse-engineering CLI
 
 From the checkout root, install the prepared application and its default command:
-
-```sh
+```
+sh
 python3 tools/re-cli/install.py
 re- /path/to/application folder
 ```
@@ -71,8 +71,8 @@ It prints a JSON report (per-function match, sizes, first differing offset, simi
 ## Building the native backend
 
 Installation requires prepared analyzers. To build them from this checkout:
-
-```sh
+```
+sh
 python3 tools/re-cli/build_backend.py -j 2
 python3 tools/re-cli/install.py
 ```
@@ -86,7 +86,7 @@ util-linux (prlimit), and the native runtime libraries; Bun extraction also
 requires libzstd.so.1. No Python package installation is required.
 
 Run the integration checks with the prepared backend:
-
-```sh
+```
+sh
 python3 -m unittest discover -s tools/re-cli/tests -v
 ```
