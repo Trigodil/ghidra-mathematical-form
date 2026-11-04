@@ -22,7 +22,7 @@ def read_evidence(path):
                 'arity': int(fields[6]), 'inputs': [], 'output': None,
             }
             records.append(current)
-        elif fields[0] == 'parameter' and len(fields) == 9 and current is not None:
+        elif fields[0] == 'parameter' and len(fields) in (9, 10) and current is not None:
             if fields[7] not in ('0', '1'):
                 raise ValueError('Invalid parameter lock')
             parameter = {
@@ -30,6 +30,7 @@ def read_evidence(path):
                 'offset': int(fields[4], 16), 'size': int(fields[5]),
                 'metatype': int(fields[6]), 'locked': fields[7] == '1',
                 'type_descriptor': fields[8],
+                'pieces': fields[9] if len(fields) == 10 else '',
             }
             if fields[1] == 'input':
                 current['inputs'].append(parameter)
@@ -93,7 +94,7 @@ def compare(base, functions):
             if call[key] != definition[key]:
                 differences.append(key)
         for index, (left, right) in enumerate(zip(call['inputs'], definition['inputs'])):
-            if any(left[key] != right[key] for key in ('space', 'offset', 'size')):
+            if any(left[key] != right[key] for key in ('space', 'offset', 'size', 'pieces')):
                 differences.append(f'input_{index}_storage')
             if (left['type_descriptor'], left['metatype']) != (right['type_descriptor'], right['metatype']):
                 differences.append(f'input_{index}_type')
@@ -102,7 +103,7 @@ def compare(base, functions):
         if (left is None) != (right is None):
             differences.append('output_presence')
         elif left is not None:
-            if any(left[key] != right[key] for key in ('space', 'offset', 'size')):
+            if any(left[key] != right[key] for key in ('space', 'offset', 'size', 'pieces')):
                 differences.append('output_storage')
             if (left['type_descriptor'], left['metatype']) != (right['type_descriptor'], right['metatype']):
                 differences.append('output_type')
@@ -114,6 +115,20 @@ def compare(base, functions):
             'missing_functions': missing, 'errors': errors, 'conflicts': conflicts,
             'unresolved_or_untrusted_call_sites': indirect_calls,
             'interpretation': 'independent decompiler inferences; conflicts are not proof of ABI'}
+
+
+def seed_type(parameter):
+    descriptor = parameter['type_descriptor']
+    return f"b15_{parameter['size']}" if descriptor == 'unsupported' else descriptor
+
+
+def proven_noreturn(base, address):
+    """True when the callee's own finished flow had no return, per its quality flags."""
+    try:
+        path = Path(base) / 'functions' / f'{address:x}' / 'quality.tsv'
+        return dict(line.split('\t') for line in path.read_text().splitlines()).get('noreturn') == '1'
+    except (OSError, ValueError):
+        return False
 
 
 def seed_manifests(base, rows, imports=()):
@@ -157,15 +172,22 @@ def seed_manifests(base, rows, imports=()):
                 rejected.append({'target': target, 'reason': 'unsupported prototype model'})
                 continue
             parameters = [definition['output']] + definition['inputs']
-            if any(p is None or p['type_descriptor'] == 'unsupported' for p in parameters):
+            if any(p is None or not 1 <= p['size'] <= 16 and p['type_descriptor'] == 'unsupported'
+                   for p in parameters):
                 rejected.append({'target': target, 'reason': 'unsupported type'})
                 continue
-            if any(p['space'] not in ('invalid', 'register', 'stack') for p in parameters):
+            if any(p['space'] not in ('invalid', 'register', 'stack', 'join') for p in parameters):
+                rejected.append({'target': target, 'reason': 'unsupported storage'})
+                continue
+            if any((p['space'] == 'join') == (not p['pieces']) for p in parameters):
                 rejected.append({'target': target, 'reason': 'unsupported storage'})
                 continue
             fields = [f'{target:x}', definition['model']]
-            fields.extend(f"{p['type_descriptor']}@{p['space']}:{p['offset']:x}:{p['size']}"
-                          for p in parameters)
+            # Aggregates and pointers to them keep their storage as an unknown word of the same size.
+            fields.extend(f"{seed_type(p)}@{p['space']}:{p['offset']:x}:{p['size']}"
+                          + (f"/{p['pieces']}" if p['pieces'] else '') for p in parameters)
+            if proven_noreturn(base, target):
+                fields.append('noreturn')
             lines.append('\t'.join(fields))
             accepted.append(target)
         result[caller] = ('\n'.join(lines) + ('\n' if lines else ''),

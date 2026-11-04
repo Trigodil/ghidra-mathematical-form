@@ -18,9 +18,30 @@ ODD_TYPE = re.compile(r'unk(?:u?int|byte)\d+')
 # Imports and p-code user operations have no body in the image; declare, never define.
 # Variadic form keeps calls whose arguments the decompiler dropped well formed.
 USEROPS = {
-    'invalidInstructionException': 'extern code *invalidInstructionException(void);',
+    # UD2 raises SIGILL; the userop never returns a target.
+    'invalidInstructionException': 'static inline code *invalidInstructionException(void) { __builtin_trap(); }',
     **{name: f'extern void {name}(...);' for name in ('abort', 'exit', '__assert_fail', '__stack_chk_fail')},
 }
+# SSE userops on xunknown16 with their instruction semantics; operand 1 is the destination register.
+_LANES = ('static inline xunknown16 {name}(xunknown16 d, xunknown16 c) {{ uint16_t w[8]; uint64_t n = (uint64_t)c; '
+          '__builtin_memcpy(w, &d, 16); for (int i = 0; i < 8; i++) w[i] = {body}; '
+          'xunknown16 r; __builtin_memcpy(&r, w, 16); return r; }}')
+SSE_OPS = {
+    'pshuflw': 'static inline xunknown16 pshuflw(xunknown16 d, xunknown16 s, uint8_t m) { uint16_t w[8], r[8]; '
+               '(void)d; __builtin_memcpy(w, &s, 16); __builtin_memcpy(r, w, 16); '
+               'for (int i = 0; i < 4; i++) r[i] = w[(m >> (2 * i)) & 3]; xunknown16 v; __builtin_memcpy(&v, r, 16); return v; }',
+    'psllw': _LANES.format(name='psllw', body='n > 15 ? 0 : (uint16_t)(w[i] << n)'),
+    'psraw': _LANES.format(name='psraw', body='(uint16_t)((int16_t)w[i] >> (n > 15 ? 15 : n))'),
+    'psubusb': 'static inline xunknown16 psubusb(xunknown16 a, xunknown16 b) { uint8_t x[16], y[16]; '
+               '__builtin_memcpy(x, &a, 16); __builtin_memcpy(y, &b, 16); for (int i = 0; i < 16; i++) x[i] = x[i] > y[i] ? x[i] - y[i] : 0; '
+               'xunknown16 r; __builtin_memcpy(&r, x, 16); return r; }',
+}
+# CPUID ops return the address of {eax, ebx, ecx, edx} for the requested leaf (sub-leaf 0).
+for _name in ('cpuid_basic_info', 'cpuid_Extended_Feature_Enumeration_info'):
+    SSE_OPS[_name] = (f'static inline unsigned long {_name}(unsigned int leaf) {{ static __thread unsigned int r[4]; '
+                      '__asm__ volatile("cpuid" : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3]) : "a"(leaf), "c"(0)); '
+                      'return (unsigned long)r; }')
+USEROPS.update(SSE_OPS)
 # Return types of libc imports (names as in the backend's importSignatures). Arguments stay variadic
 # because the decompiler already shaped each call site; only the result type
 # must be right, or pointer results become integers.
@@ -84,7 +105,8 @@ def signature(text):
     brace = masked.find('{')
     if brace < 0:
         return None
-    prefix = masked[:brace].strip()
+    # Vector types are words in the emitted definition, so the prototype must say the same.
+    prefix = lower_vectors(masked[:brace].strip())[0]
     match = re.fullmatch(r'([A-Za-z_][A-Za-z_0-9\s*]*?)\b([A-Za-z_][A-Za-z_0-9]*)\s*\(([^;{}]*)\)', prefix)
     if not match or '(' in match[3] or ')' in match[3]:
         return None
@@ -199,7 +221,7 @@ def lower_vectors(text):
                     index -= 1
                 callee = re.search(r'(\w+)\s*$', before[:index])
                 if callee and callee[1] not in ('if', 'while', 'switch', 'return') \
-                        and not HELPER_CALLEE.fullmatch(callee[1]):
+                        and callee[1] not in SSE_OPS and not HELPER_CALLEE.fullmatch(callee[1]):
                     return True
         return False
 
@@ -249,6 +271,12 @@ def lower_storage(text):
 
     used, unresolved = set(), []
     pattern = re.compile(r'\b([A-Za-z_]\w*)\._(\d+)_(\d+)_\b')
+    # Scalar locals a slice may overrun; those are widened below so the slice stays in storage.
+    scalars = {}
+    for m in re.finditer(r'^[ \t]*(?:(xunknown|uint|int|undefined)(\d+)|\w+[ \t]*\*)[ \t]*([A-Za-z_]\w*)[ \t]*;',
+                         code_mask(text), re.M):
+        scalars[m[3]] = int(m[2]) if m[2] else 8
+    widened = {}
 
     def lower(fragment):
         mask = code_mask(fragment)
@@ -257,20 +285,23 @@ def lower_storage(text):
             if match.start() < cursor:
                 continue
             name, offset, width = match[1], int(match[2]), int(match[3])
-            if not 1 <= width <= 16 or offset + width > 16:
+            if not 1 <= width <= 16:
                 unresolved.append(match[0])
                 continue
+            if offset + width > scalars.get(name, 1 << 30):
+                widened[name] = max(widened.get(name, 0), offset + width)
+                name += '__w'
             after = mask[match.end():].lstrip()
             before = mask[:match.start()].rstrip()
             write = after.startswith('=') and not after.startswith('==')
-            if after.startswith(('++','--','+=','-=','*=','/=','%=', '&=', '|=', '^=', '<<=', '>>=')) or before.endswith(('++','--','&')):
+            if after.startswith(('++','--','+=','-=','*=','/=','%=', '&=', '|=', '^=', '<<=', '>>=')) or before.endswith(('++','--')) or re.search(r'(?<!&)&$', before) and not re.search(r'[\w)\]]\s*&$', before):
                 unresolved.append(match[0])
                 continue
             end = match.end()
             if write:
                 # Only an assignment that is a whole statement or comma operand is rewritten.
                 # A braceless if, else, case label or do body also starts a statement.
-                if before and not re.search(r'(?:[;{}:),]|\belse|\bdo)$', before):
+                if before and not re.search(r'(?:[;{}:(),]|\belse|\bdo)$', before):
                     unresolved.append(match[0])
                     continue
                 start = end + len(mask[end:]) - len(mask[end:].lstrip()) + 1
@@ -298,8 +329,31 @@ def lower_storage(text):
         return ''.join(pieces)
 
     lowered = lower(text)
+    for name, size in widened.items():
+        mask = code_mask(lowered)
+        decl = re.compile(rf'^([ \t]*)((?:\w+)[ \t]*\*?)[ \t]*\b{name}\b[ \t]*;', re.M).search(mask)
+        if decl is None:
+            continue
+        kind = lowered[decl.start(2):decl.end(2)].strip()
+        pad = f'xunknown1 pad[{size - scalars[name]}]; ' if size > scalars[name] else ''
+        scalar = re.sub(r'\s+', ' ', kind)
+        lowered = (lowered[:decl.start()] + f'{decl[1]}struct {{ {scalar} value__; {pad}}} {name}__w;' +
+                   lowered[decl.end():])
+        mask = code_mask(lowered)
+        mask = code_mask(lowered)
+        pieces, cursor = [], 0
+        for use in re.finditer(rf'(?<![\w.>]){name}\b', mask):
+            pieces.extend([lowered[cursor:use.start()], f'{name}__w.value__'])
+            cursor = use.end()
+        lowered = ''.join(pieces) + lowered[cursor:]
     unresolved.extend(re.findall(r'\._\d+_\d+_\b', code_mask(lowered)))
     return lowered, used, dict(promoted_storage=promoted, unresolved_slices=sorted(set(unresolved)))
+
+
+def initialize_tls_base(text):
+    """The decompiler leaves the FS base, used for stack canary and TLS reads, uninitialized."""
+    return re.sub(r'^([ \t]*(?:int8|uint8|xunknown8)[ \t]+in_FS_OFFSET)[ \t]*;',
+                  r'\1 = __recovery_fs_base();', text, flags=re.M)
 
 
 def lower_odd_widths(text):
@@ -320,29 +374,35 @@ def lower_odd_widths(text):
     def lowered_pass(source):
         mask = code_mask(source)
 
-        def close_paren(start):
-            depth = 0
+        def close_paren(start, opener='('):
+            closer, depth = ')' if opener == '(' else ']', 0
             for index in range(start, len(mask)):
-                if mask[index] == '(':
+                if mask[index] == opener:
                     depth += 1
-                elif mask[index] == ')':
+                elif mask[index] == closer:
                     depth -= 1
                     if depth == 0:
                         return index
             return None
 
         def operand_end(start):
-            """End of a parenthesized expression, a name, or a call of a name."""
+            """End of a parenthesized expression or name, with its call, index and member suffixes."""
             if mask[start:start + 1] == '(':
                 end = close_paren(start)
-                return None if end is None else end + 1
-            name = re.compile(r'\*?\s*[A-Za-z_]\w*|\d\w*').match(mask, start)
-            if name is None:
-                return None
-            end = name.end()
-            if mask[end:end + 1] == '(':
-                end = close_paren(end)
-                return None if end is None else end + 1
+                end = None if end is None else end + 1
+            else:
+                name = re.compile(r'\*?\s*[A-Za-z_]\w*|\d\w*').match(mask, start)
+                end = None if name is None else name.end()
+            while end is not None:
+                suffix = re.compile(r'\s*(?:\.|->)\s*[A-Za-z_]\w*').match(mask, end)
+                if suffix:
+                    end = suffix.end()
+                    continue
+                opener = re.compile(r'\s*([(\[])').match(mask, end)
+                if opener is None:
+                    break
+                closer = close_paren(opener.end() - 1, opener[1])
+                end = None if closer is None else closer + 1
             return end
 
         edits = []
@@ -363,8 +423,7 @@ def lower_odd_widths(text):
         for match in cast.finditer(mask):
             width = int(match[2])
             end = operand_end(match.end())
-            if not odd(width) or end is None or mask[end:].lstrip()[:1] in ('[', '.') or \
-                    mask[end:].lstrip().startswith('->'):
+            if not odd(width) or end is None:
                 continue
             expression, signed = source[match.end():end], match[1] == 'int'
             if signed:
@@ -455,6 +514,10 @@ def assemble(binary_report):
     base = Path(binary_report['output'])
     bodies, missing, definitions, prototypes = [], [], {}, []
     stubs, imports, runtime = link_boundary(binary_report.get('path'))
+    try:
+        image = Elf(binary_report['path'])
+    except (KeyError, OSError, TypeError, ValueError, IndexError):
+        image = None
     excluded, called_imports = [], set()
     for row in binary_report.get('functions', []):
         if row.get('name') in runtime or any(lo <= row['address'] < hi for lo, hi in stubs):
@@ -489,7 +552,7 @@ def assemble(binary_report):
     for address, text in bodies:
         lowered, vectors = lower_vectors(replace_identifiers(text, renames))
         lowered, used, detail = lower_storage(lowered)
-        lowered, odd_used = lower_odd_widths(lowered)
+        lowered, odd_used = lower_odd_widths(initialize_tls_base(lowered))
         transformed.append(lowered)
         odd_widths.update(odd_used)
         slice_widths.update(used)
@@ -519,8 +582,11 @@ def assemble(binary_report):
                'typedef float float4;', 'typedef double float8;',
                'typedef long code(...);', 'typedef uint8_t undefined;']
     for width in WIDTHS:
-        aliases.extend([f'typedef {ctype(width, True)} int{width};',
-                        f'typedef {ctype(width)} uint{width}, undefined{width}, xunknown{width};'])
+        aliases.append(f'typedef {ctype(width, True)} int{width};')
+        # Decompiled 16-byte accesses are not 16-aligned, so GCC must not emit aligned vector moves.
+        tail = ' __attribute__((aligned(1)))' if width == 16 else ''
+        aliases.extend(f'typedef {ctype(width)} {name}{width}{tail};'
+                       for name in ('uint', 'undefined', 'xunknown'))
     for name in sorted(t for t in tokens if ODD_TYPE.fullmatch(t)):
         width, signed = int(re.search(r'\d+', name)[0]), name.startswith('unkint')
         if width in WIDTHS:
@@ -529,12 +595,16 @@ def assemble(binary_report):
             # Array typedefs let unresolved odd-width pointers and prototypes declare.
             aliases.append(f'typedef {"signed" if signed else "unsigned"} char {name}[{width}];')
     aliases.extend(USEROPS[t] for t in sorted(tokens & USEROPS.keys()))
+    if 'in_FS_OFFSET' in tokens:
+        aliases.append('static inline uint64_t __recovery_fs_base(void) { uint64_t b; '
+                       '__asm__("mov %%fs:0, %0" : "=r"(b)); return b; }')
     # Imports the decompiler already names are referenced too; none has a body here.
     called_imports |= (tokens & set(imports.values())) - set(definitions.values())
     aliases.extend(f'extern {IMPORT_RETURN.get(name, "long")} {name}(...);'
                    for name in sorted(called_imports - USEROPS.keys()))
     header = '\n'.join(aliases + implementations + [slice_helpers(w) for w in sorted(slice_widths)] + [odd_width_helper(w) for w in sorted(odd_widths)] + ['#endif', ''])
-    globals_source, global_metadata = global_state.recover(base, binary_report.get('functions', []), definitions)
+    globals_source, global_metadata = global_state.recover(base, binary_report.get('functions', []), definitions,
+                                                              code_mask(source), image)
     # Local symbols such as __PRETTY_FUNCTION__.18 are renamed like the function clones.
     globals_source = clone_identifiers(globals_source)
     declared = [clone_identifiers(name) for name in

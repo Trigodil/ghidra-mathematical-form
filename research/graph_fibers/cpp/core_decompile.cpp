@@ -284,6 +284,19 @@ static std::string describePrototypeType(const ghidra::Datatype *type, int depth
         std::to_string(type->getSize());
 }
 
+// Join pieces as space:offset:size, most significant first, since join offsets are per-run ids.
+static std::string joinPieces(const ghidra::Address &address) {
+    const auto *record = address.getSpace()->findJoin(address.getOffset());
+    if (record == nullptr) return "";
+    std::ostringstream text;
+    for (int i = 0; i < record->numPieces(); ++i) {
+        const auto &piece = record->getPiece(i);
+        text << (i ? "," : "") << piece.space->getName() << ':' << std::hex << piece.offset
+             << std::dec << ':' << piece.size;
+    }
+    return text.str();
+}
+
 // Record the decompiler's inferred machine storage without claiming that it is
 // an authoritative source signature. Each decompilation has its own context.
 static void exportPrototype(std::ostream &out, const std::string &kind,
@@ -302,7 +315,10 @@ static void exportPrototype(std::ostream &out, const std::string &kind,
             << std::dec << '\t' << param->getSize() << '\t'
             << static_cast<int>(param->getType()->getMetatype()) << '\t'
             << param->isTypeLocked() << '\t'
-            << describePrototypeType(param->getType()) << "\n";
+            << describePrototypeType(param->getType());
+        if (!address.isInvalid() && address.getSpace()->getType() == ghidra::IPTR_JOIN)
+            out << '\t' << joinPieces(address);
+        out << "\n";
     };
     writeParameter("output", -1, proto.getOutput());
     for (int i = 0; i < proto.numParams(); ++i)
@@ -314,6 +330,7 @@ struct SeedStorage {
     std::string space;
     uint64_t offset;
     int size;
+    std::string pieces;
 };
 
 static ghidra::Datatype *parseSeedType(ghidra::Architecture &arch,
@@ -347,7 +364,12 @@ static ghidra::Datatype *parseSeedType(ghidra::Architecture &arch,
     return arch.types->getBase(size, meta);
 }
 
-static SeedStorage parseSeedStorage(ghidra::Architecture &arch, const std::string &field) {
+static SeedStorage parseSeedStorage(ghidra::Architecture &arch, std::string field) {
+    std::string pieces;
+    if (auto slash = field.find('/'); slash != std::string::npos) {
+        pieces = field.substr(slash + 1);
+        field.resize(slash);
+    }
     auto at = field.find('@');
     if (at == std::string::npos) throw std::runtime_error("invalid storage descriptor");
     auto first = field.find(':', at);
@@ -367,7 +389,8 @@ static SeedStorage parseSeedStorage(ghidra::Architecture &arch, const std::strin
     int size = std::stoi(sizeText, &consumed);
     if (consumed != sizeText.size()) throw std::runtime_error("invalid size");
     if (size != type->getSize()) throw std::runtime_error("storage size mismatch");
-    return {type, space, offset, size};
+    if ((space == "join") == pieces.empty()) throw std::runtime_error("join pieces mismatch");
+    return {type, space, offset, size, pieces};
 }
 
 static void applyPrototypeSeeds(StaticElfArchitecture &arch, ghidra::Scope *scope,
@@ -399,7 +422,12 @@ static void applyPrototypeSeeds(StaticElfArchitecture &arch, ghidra::Scope *scop
             auto *model = arch.getModel(fields[1]);
             if (model == nullptr || model->isUnknown()) throw std::runtime_error("unknown model");
             std::vector<SeedStorage> expected;
-            for (size_t i = 2; i < fields.size(); ++i) expected.push_back(parseSeedStorage(arch, fields[i]));
+            bool noReturn = false;
+            for (size_t i = 2; i < fields.size(); ++i) {
+                if (fields[i] == "noreturn") noReturn = true;
+                else expected.push_back(parseSeedStorage(arch, fields[i]));
+            }
+            if (expected.empty()) throw std::runtime_error("invalid row");
             ghidra::PrototypePieces pieces;
             pieces.model = model;
             pieces.outtype = expected[0].type;
@@ -415,7 +443,11 @@ static void applyPrototypeSeeds(StaticElfArchitecture &arch, ghidra::Scope *scop
                 const auto address = assigned[i].addr;
                 const std::string space = address.isInvalid() ? "invalid" : address.getSpace()->getName();
                 const uint64_t offset = address.isInvalid() ? 0 : address.getOffset();
-                if (space != expected[i].space || offset != expected[i].offset ||
+                // Join offsets are per-run ids, so joins compare by their ordered pieces.
+                const bool join = space == "join" && expected[i].space == "join";
+                if (join ? joinPieces(address) != expected[i].pieces : false)
+                    throw std::runtime_error("ABI storage mismatch");
+                if (space != expected[i].space || (!join && offset != expected[i].offset) ||
                     assigned[i].type->getSize() != expected[i].size || assigned[i].flags != 0)
                     throw std::runtime_error("ABI storage mismatch");
             }
@@ -427,6 +459,7 @@ static void applyPrototypeSeeds(StaticElfArchitecture &arch, ghidra::Scope *scop
             }
             if (fd == nullptr) throw std::runtime_error("cannot create function");
             fd->getFuncProto().setPieces(pieces);
+            if (noReturn) fd->getFuncProto().setNoReturn(true);
             results << fields[0] << "\tapplied\n";
         } catch (const std::exception &error) {
             results << rowTarget << "\trejected\t" << error.what() << "\n";
@@ -652,6 +685,13 @@ int main(int argc,char **argv) {
         quality << "unimplemented\t" << (fd->hasUnimplemented()?1:0) << "\n";
         quality << "bad_data\t" << (fd->hasBadData()?1:0) << "\n";
         quality << "unknown_relocation_read\t" << (image->hasUnknownRelocationRead()?1:0) << "\n";
+        // Proven only when the finished flow has blocks, no real RETURN (halts are not returns),
+        // and no unresolved indirect jump.
+        bool noReturn = fd->getBasicBlocks().getSize() > 0 &&
+            fd->beginOp(ghidra::CPUI_BRANCHIND) == fd->endOp(ghidra::CPUI_BRANCHIND);
+        for (auto it = fd->beginOp(ghidra::CPUI_RETURN); it != fd->endOp(ghidra::CPUI_RETURN); ++it)
+            if (((*it)->getHaltType() & (ghidra::PcodeOp::halt | ghidra::PcodeOp::noreturn)) == 0) noReturn = false;
+        quality << "noreturn\t" << (noReturn?1:0) << "\n";
         quality.close(); fibers::require(bool(quality),"Cannot save quality data");
         std::cout<<"pseudocode_emitted; peel_tests="<<peel->getNumTests()
                  <<"; peel_applications="<<peel->getNumApply()<<'\n';

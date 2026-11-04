@@ -106,3 +106,39 @@ class Elf:
                 if slot in slots:
                     stubs[section["addr"] + start] = slots[slot]
         return stubs
+
+    def read(self, address, length):
+        """Bytes of an initialized section at a virtual address, or None."""
+        for section in self.sections:
+            if (section["type"] == 1 and section["addr"] <= address and
+                    address + length <= section["addr"] + section["size"]):
+                start = section["offset"] + address - section["addr"]
+                return self.data[start:start + length]
+        return None
+
+    def section_at(self, address):
+        for section in self.sections:
+            if section["addr"] and section["addr"] <= address < section["addr"] + section["size"]:
+                return section
+        return None
+
+    def data_relocations(self):
+        """Map a patched address to its target address (None when it names an import)."""
+        if hasattr(self, "_relocated"):
+            return self._relocated
+        found = self._relocated = {}
+        for section in self.sections:
+            if section["type"] != 4:
+                continue
+            symbols = self.sections[section["link"]] if section["link"] else None
+            for offset in range(section["offset"], section["offset"] + section["size"], 24):
+                where, info, addend = struct.unpack_from("<QQq", self.data, offset)
+                kind, index = info & 0xFFFFFFFF, info >> 32
+                if kind == 8:
+                    found[where] = addend
+                elif kind in (1, 6) and index and symbols:
+                    _, _, _, shndx, value, _ = struct.unpack_from("<IBBHQQ", self.data,
+                                                                  symbols["offset"] + index * 24)
+                    found[where] = value + addend if shndx else None
+        return found
+

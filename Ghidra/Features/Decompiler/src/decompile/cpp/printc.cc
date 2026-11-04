@@ -855,6 +855,11 @@ void PrintC::opFloatInt2Float(const PcodeOp *op)
   if (!option_nocasts) {
     pushOp(&typecast,op);
     pushType(dt);
+    if (vn0->getHighTypeReadFacing(op)->getMetatype() == TYPE_PTR) {
+      // C cannot convert a pointer to floating point directly
+      pushOp(&typecast,op);
+      pushType(glb->types->getBase(vn0->getSize(),TYPE_INT));
+    }
   }
   pushVn(vn0,op,mods);
 }
@@ -2147,20 +2152,9 @@ void PrintC::pushPartialSymbol(const Symbol *sym,int4 off,int4 sz,
 void PrintC::pushMismatchSymbol(const Symbol *sym,int4 off,int4 sz,
 				const Varnode *vn,const PcodeOp *op)
 {
-  if (off==0) {
-    EmitMarkup::syntax_highlight tokenColor = getSymbolHighlight(sym);
-  // The most common situation is when a user sees a reference
-  // to a variable and forces a symbol to be there but guesses
-  // the type (or size) incorrectly
-  // The address of the symbol is correct, but the size is too small
-
-  // We prepend an underscore to indicate a close
-  // but not quite match
-    string nm = '_'+sym->getDisplayName();
-    pushAtom(Atom(nm,vartoken,tokenColor,op,vn));
-  }
-  else
-    pushUnnamedLocation(vn->getAddr(),vn->getSize(),vn,op);
+  // The access extends past the symbol, so name the bytes as a slice of it, as a partial symbol does
+  EmitMarkup::syntax_highlight tokenColor = getSymbolHighlight(sym);
+  pushAtom(Atom(sym->getDisplayName() + '.' + unnamedField(off,sz),vartoken,tokenColor,op,vn));
 }
 
 void PrintC::pushImpliedField(const Varnode *vn,const PcodeOp *op)

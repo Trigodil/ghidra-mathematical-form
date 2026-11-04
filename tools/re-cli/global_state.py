@@ -112,7 +112,35 @@ def initializer(record, shape, literal=False):
     ), None
 
 
-def recover(base, rows, functions=None):
+def relocated_words(record, image):
+    """Split a byte array holding relocated pointers into (word, target) pairs, or None."""
+    if (image is None or record.get("initial_status") != "relocation_requires_resolution"
+            or record.get("pointer_target") is not None or record["size"] % 8
+            or not re.fullmatch(r"\s*xunknown1\s+\w+\s*\[\s*\d+\s*\]\s*;", record.get("declaration", ""))):
+        return None
+    raw = image.read(record["address"], record["size"])
+    if raw is None:
+        return None
+    patched = image.data_relocations()
+    words = []
+    for offset in range(0, record["size"], 8):
+        address = record["address"] + offset
+        if address in patched and patched[address] is None:
+            return None
+        words.append((int.from_bytes(raw[offset:offset + 8], "little"), patched.get(address)))
+    return words
+
+
+def pointer_retyped(declaration, name, source):
+    """Declare an 8-byte integer global as a pointer when the code dereferences or indexes it."""
+    match = re.fullmatch(r"([A-Za-z_]\w*)\s+" + re.escape(name) + r"\s*;", declaration)
+    if not match or INTEGER_TYPES.get(match[1]) != 8:
+        return declaration
+    use = re.compile(rf"\b{re.escape(name)}\s*\[|(?<![\w)\]])\s*\*\s*\(?\s*{re.escape(name)}\b")
+    return f"{match[1]} *{name};" if use.search(source) else declaration
+
+
+def recover(base, rows, functions=None, source="", image=None):
     functions = functions or {}
     records, obligations, metadata_missing = {}, [], []
     consumed = 0
@@ -155,7 +183,13 @@ def recover(base, rows, functions=None):
                     ):
                         raise ValueError("invalid_initial_bytes")
                     record["initial_hex"] = raw.lower()
-                record["declaration"] = " ".join(record.get("declaration", "").split())
+                if re.fullmatch(r"[A-Za-z_]\w*(?:\.\w+)+", name):
+                    # Local symbols such as ML_Code.0 become identifiers, as for function clones.
+                    record["declaration"] = record.get("declaration", "").replace(name, name.replace(".", "_"))
+                    name = record["name"] = name.replace(".", "_")
+                record["declaration"] = pointer_retyped(
+                    " ".join(record.get("declaration", "").split()), name, source
+                )
                 record.setdefault("pointer_target", None)
                 record.setdefault("pointer_target_is_code", False)
                 if type(record["pointer_target_is_code"]) is not bool:
@@ -224,7 +258,14 @@ def recover(base, rows, functions=None):
     accepted, relocated = [], {}
     blocked = set()
     extents = [(r["address"], r["address"] + r["size"]) for r in records.values()]
+    relocated_arrays = {}
     for name, record in records.items():
+        words = relocated_words(record, image)
+        if words is not None:
+            relocated_arrays[name] = words
+    for name, record in records.items():
+        if name in relocated_arrays:
+            continue
         reason = (
             record.get("initial_status", "missing_initial_state")
             if record.get("initial_status") != "known"
@@ -356,7 +397,7 @@ def recover(base, rows, functions=None):
     # Emit initialized pointer references after data storage and aliases exist.
     # Forward declarations permit mutually referring pointer objects.
     pointer_names = {item["record"]["name"] for item in pointer_items}
-    available_names = set(exported) | pointer_names
+    available_names = set(exported) | pointer_names | set(relocated_arrays)
     address_objects = sorted(
         (r for r in records.values() if r["name"] in available_names),
         key=lambda r: (r["address"], r["name"]),
@@ -367,6 +408,18 @@ def recover(base, rows, functions=None):
         max_ends.append(
             max(max_ends[-1] if max_ends else 0, record["address"] + record["size"])
         )
+    strings = {}
+
+    def string_object(target):
+        """Name an object holding the string literal at a read-only address no symbol covers."""
+        if target not in strings:
+            section = image.section_at(target) if image else None
+            raw = section and image.read(target, min(4096, section["addr"] + section["size"] - target))
+            end = raw.find(b"\0") if raw else -1
+            readonly = section is not None and not section["flags"] & 5 and section["flags"] & 2
+            strings[target] = (f"__recovery_string_{target:x}", raw[: end + 1]) if end >= 0 and readonly else None
+        return strings[target][0] if strings[target] else None
+
     references = {}
     for item in pointer_items:
         record, shape = item["record"], item["shape"]
@@ -393,6 +446,10 @@ def recover(base, rows, functions=None):
                     value=f'({shape["ctype"]})((unsigned char *)&{other["name"]} + {offset})',
                     dependency=other["name"],
                 )
+            elif string_object(target):
+                references[name] = dict(
+                    value=f'({shape["ctype"]}){string_object(target)}', dependency=None
+                )
         if name not in references:
             blocked.add(name)
             obligations.append(
@@ -408,6 +465,40 @@ def recover(base, rows, functions=None):
                 obligations.append(
                     dict(name=name, reason="relocation_dependency_unresolved")
                 )
+    array_declarations = []
+    for name, words in relocated_arrays.items():
+        record = records[name]
+        values = []
+        for index, (word, target) in enumerate(words):
+            if target is None:
+                values.append(f"0x{word:x}UL")
+                continue
+            possible = [
+                other for other in address_objects
+                if other["name"] not in blocked and other["address"] <= target < other["address"] + other["size"]
+            ]
+            if possible:
+                other = min(possible, key=lambda r: (r["size"], r["name"]))
+                values.append(f'(unsigned long)((unsigned char *)&{other["name"]} + {target - other["address"]})')
+            elif functions.get(target):
+                values.append(f"(unsigned long)&{functions[target]}")
+            elif string_object(target):
+                values.append(f"(unsigned long){string_object(target)}")
+            else:
+                values = None
+                obligations.append(dict(name=name, reason="relocation_target_not_recovered", target=target))
+                break
+        if values is not None:
+            array_declarations.append(f"unsigned long __recovery_words_{name}[{len(values)}] = {{{', '.join(values)}}};")
+            array_declarations.append(
+                f'extern {record["declaration"].rstrip(";")} __attribute__((alias("__recovery_words_{name}")));'
+            )
+            exported.append(name)
+    for symbol, raw in filter(None, strings.values()):
+        declarations.append(
+            f"static const unsigned char {symbol}[{len(raw)}] = {{"
+            + ",".join(str(byte) for byte in raw) + "};"
+        )
     declarations.extend(
         "extern " + item["record"]["declaration"]
         for item in pointer_items
@@ -422,6 +513,7 @@ def recover(base, rows, functions=None):
             record["declaration"].rstrip(";") + " = " + references[name]["value"] + ";"
         )
         exported.append(name)
+    declarations.extend(array_declarations)
     # Unrecovered storage stays an explicit external symbol, never invented data.
     external = []
     for name, record in records.items():
