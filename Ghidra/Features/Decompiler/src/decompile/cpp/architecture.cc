@@ -1427,6 +1427,7 @@ void Architecture::resetDefaultsInternal(void)
   infer_pointers = true;
   analyze_for_loops = true;
   readonlypropagate = false;
+  branch_entry_tailcall = false;
   nan_ignore_all = false;
   nan_ignore_compare = true;	// Ignore only NaN operations associated with floating-point comparisons by default
   alias_block_level = 2;	// Block structs and arrays by default, but not more primitive data-types

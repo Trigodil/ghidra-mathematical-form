@@ -175,6 +175,7 @@ public:
   uint4 max_jumptable_size;	///< Maximum number of entries in a single JumpTable
   bool aggressive_ext_trim;	///< Aggressively trim inputs that look like they are sign extended
   bool readonlypropagate;	///< true if readonly values should be treated as constants
+  bool branch_entry_tailcall;	///< True if a BRANCH to another known function entry is a tail call
   bool infer_pointers;		///< True if we should infer pointers from constants that are likely addresses
   bool analyze_for_loops;	///< True if we should attempt conversion of \e whiledo loops to \e for loops
   bool nan_ignore_all;		///< True if we should ignore NaN operations, i.e. nan() always returns false

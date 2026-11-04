@@ -199,6 +199,13 @@ static void exportGlobals(ghidra::Architecture& arch,ghidra::Funcdata& function,
             size_t start=i++;
             while(i<functionText.size() && (std::isalnum(static_cast<unsigned char>(functionText[i])) || functionText[i]=='_')) ++i;
             identifiers.insert(functionText.substr(start,i-start));
+            // Local ELF symbols such as __PRETTY_FUNCTION__.18 carry a dotted clone suffix.
+            size_t dotted=i;
+            while(dotted+1<functionText.size() && functionText[dotted]=='.' && std::isalnum(static_cast<unsigned char>(functionText[dotted+1]))) {
+                ++dotted;
+                while(dotted<functionText.size() && (std::isalnum(static_cast<unsigned char>(functionText[dotted])) || functionText[dotted]=='_')) ++dotted;
+                identifiers.insert(functionText.substr(start,dotted-start));
+            }
         } else ++i;
     }
     std::ofstream metadata(path);metadata<<"{\"version\":2,\"globals\":[";
@@ -258,9 +265,287 @@ public:
     explicit StaticElfArchitecture(const std::string& file)
         :SleighArchitecture(file,"x86:LE:64:default:gcc",&std::cerr){}
 };
+// Encode only fully described primitive and pointer types. Unknown and
+// aggregate types are explicitly unsupported for prototype seeding.
+static std::string describePrototypeType(const ghidra::Datatype *type, int depth = 0) {
+    if (type == nullptr || depth > 8) return "unsupported";
+    const auto meta = type->getMetatype();
+    if (meta == ghidra::TYPE_PTR) {
+        const auto *pointer = dynamic_cast<const ghidra::TypePointer *>(type);
+        if (pointer == nullptr) return "unsupported";
+        const auto child = describePrototypeType(pointer->getPtrTo(), depth + 1);
+        if (child == "unsupported") return child;
+        return "p" + std::to_string(type->getSize()) + "_" + child;
+    }
+    if (meta != ghidra::TYPE_VOID && meta != ghidra::TYPE_INT &&
+        meta != ghidra::TYPE_UINT && meta != ghidra::TYPE_BOOL &&
+        meta != ghidra::TYPE_FLOAT && meta != ghidra::TYPE_UNKNOWN) return "unsupported";
+    return "b" + std::to_string(static_cast<int>(meta)) + "_" +
+        std::to_string(type->getSize());
+}
+
+// Record the decompiler's inferred machine storage without claiming that it is
+// an authoritative source signature. Each decompilation has its own context.
+static void exportPrototype(std::ostream &out, const std::string &kind,
+                            uint64_t site, uint64_t target,
+                            const ghidra::FuncProto &proto) {
+    out << kind << '\t' << std::hex << site << '\t' << target << std::dec
+        << '\t' << (proto.hasModel() ? proto.getModelName() : "unknown")
+        << '\t' << proto.isDotdotdot() << '\t' << proto.hasCustomStorage()
+        << '\t' << proto.numParams() << "\n";
+    auto writeParameter = [&](const char *role, int index, ghidra::ProtoParameter *param) {
+        if (param == nullptr || param->getType() == nullptr) return;
+        auto address = param->getAddress();
+        out << "parameter\t" << role << '\t' << index << '\t'
+            << (address.isInvalid() ? "invalid" : address.getSpace()->getName())
+            << '\t' << std::hex << (address.isInvalid() ? 0 : address.getOffset())
+            << std::dec << '\t' << param->getSize() << '\t'
+            << static_cast<int>(param->getType()->getMetatype()) << '\t'
+            << param->isTypeLocked() << '\t'
+            << describePrototypeType(param->getType()) << "\n";
+    };
+    writeParameter("output", -1, proto.getOutput());
+    for (int i = 0; i < proto.numParams(); ++i)
+        writeParameter("input", i, proto.getParam(i));
+}
+
+struct SeedStorage {
+    ghidra::Datatype *type;
+    std::string space;
+    uint64_t offset;
+    int size;
+};
+
+static ghidra::Datatype *parseSeedType(ghidra::Architecture &arch,
+                                      const std::string &text, size_t &pos,
+                                      int depth = 0) {
+    if (depth > 8 || pos >= text.size()) throw std::runtime_error("type depth");
+    char kind = text[pos++];
+    size_t start = pos;
+    while (pos < text.size() && std::isdigit(static_cast<unsigned char>(text[pos]))) ++pos;
+    if (pos == start || pos >= text.size() || text[pos++] != '_')
+        throw std::runtime_error("invalid type descriptor");
+    int number = std::stoi(text.substr(start, pos - start - 1));
+    if (kind == 'p') {
+        if (number != 8) throw std::runtime_error("unsupported pointer size");
+        return arch.types->getTypePointer(number, parseSeedType(arch, text, pos, depth + 1), 1);
+    }
+    if (kind != 'b') throw std::runtime_error("unknown type descriptor");
+    start = pos;
+    while (pos < text.size() && std::isdigit(static_cast<unsigned char>(text[pos]))) ++pos;
+    if (pos == start) throw std::runtime_error("missing type size");
+    int size = std::stoi(text.substr(start, pos - start));
+    auto meta = static_cast<ghidra::type_metatype>(number);
+    if (meta == ghidra::TYPE_VOID && size == 0) return arch.types->getTypeVoid();
+    if ((meta == ghidra::TYPE_BOOL && size != 1) ||
+        (meta == ghidra::TYPE_FLOAT && size != 4 && size != 8 && size != 10 && size != 16))
+        throw std::runtime_error("unsupported primitive size");
+    if (size < 1 || size > 16 ||
+        (meta != ghidra::TYPE_UNKNOWN && meta != ghidra::TYPE_INT &&
+         meta != ghidra::TYPE_UINT && meta != ghidra::TYPE_BOOL && meta != ghidra::TYPE_FLOAT))
+        throw std::runtime_error("unsupported primitive");
+    return arch.types->getBase(size, meta);
+}
+
+static SeedStorage parseSeedStorage(ghidra::Architecture &arch, const std::string &field) {
+    auto at = field.find('@');
+    if (at == std::string::npos) throw std::runtime_error("invalid storage descriptor");
+    auto first = field.find(':', at);
+    if (first == std::string::npos) throw std::runtime_error("invalid storage descriptor");
+    auto second = field.find(':', first + 1);
+    if (second == std::string::npos)
+        throw std::runtime_error("invalid storage descriptor");
+    size_t pos = 0;
+    auto *type = parseSeedType(arch, field.substr(0, at), pos);
+    if (pos != at) throw std::runtime_error("trailing type descriptor");
+    std::string space = field.substr(at + 1, first - at - 1);
+    const auto offsetText = field.substr(first + 1, second - first - 1);
+    const auto sizeText = field.substr(second + 1);
+    size_t consumed = 0;
+    auto offset = std::stoull(offsetText, &consumed, 16);
+    if (consumed != offsetText.size()) throw std::runtime_error("invalid offset");
+    int size = std::stoi(sizeText, &consumed);
+    if (consumed != sizeText.size()) throw std::runtime_error("invalid size");
+    if (size != type->getSize()) throw std::runtime_error("storage size mismatch");
+    return {type, space, offset, size};
+}
+
+static void applyPrototypeSeeds(StaticElfArchitecture &arch, ghidra::Scope *scope,
+                                uint64_t selected, const std::string &path,
+                                const std::filesystem::path &output,
+                                const std::unordered_set<uint64_t> &imports) {
+    std::ifstream input(path);
+    fibers::require(bool(input), "Cannot open prototype seed manifest");
+    std::ofstream results(output / "prototype-seeds-result.tsv");
+    std::string line;
+    size_t rows = 0;
+    while (std::getline(input, line)) {
+        fibers::require(++rows <= 100000 && line.size() <= 16384, "Prototype manifest too large");
+        std::string rowTarget = "-";
+        try {
+            std::istringstream stream(line);
+            std::string field;
+            std::vector<std::string> fields;
+            while (std::getline(stream, field, '\t')) fields.push_back(field);
+            if (fields.size() < 3 || fields.size() > 67) throw std::runtime_error("invalid row");
+            rowTarget = fields[0];
+            size_t consumed = 0;
+            uint64_t target = std::stoull(fields[0], &consumed, 16);
+            if (consumed != fields[0].size()) throw std::runtime_error("invalid target");
+            auto *image = static_cast<MappedElfImage *>(arch.loader);
+            if (!image->executableAddress(target)) throw std::runtime_error("non-executable target");
+            if (target == selected) throw std::runtime_error("self seed");
+            if (imports.count(target)) throw std::runtime_error("import prototype is fixed");
+            auto *model = arch.getModel(fields[1]);
+            if (model == nullptr || model->isUnknown()) throw std::runtime_error("unknown model");
+            std::vector<SeedStorage> expected;
+            for (size_t i = 2; i < fields.size(); ++i) expected.push_back(parseSeedStorage(arch, fields[i]));
+            ghidra::PrototypePieces pieces;
+            pieces.model = model;
+            pieces.outtype = expected[0].type;
+            pieces.firstVarArgSlot = -1;
+            for (size_t i = 1; i < expected.size(); ++i) {
+                pieces.intypes.push_back(expected[i].type);
+                pieces.innames.push_back("");
+            }
+            std::vector<ghidra::ParameterPieces> assigned;
+            model->assignParameterStorage(pieces, assigned, false);
+            if (assigned.size() != expected.size()) throw std::runtime_error("implicit parameters");
+            for (size_t i = 0; i < assigned.size(); ++i) {
+                const auto address = assigned[i].addr;
+                const std::string space = address.isInvalid() ? "invalid" : address.getSpace()->getName();
+                const uint64_t offset = address.isInvalid() ? 0 : address.getOffset();
+                if (space != expected[i].space || offset != expected[i].offset ||
+                    assigned[i].type->getSize() != expected[i].size || assigned[i].flags != 0)
+                    throw std::runtime_error("ABI storage mismatch");
+            }
+            ghidra::Address address(arch.getDefaultCodeSpace(), target);
+            auto *fd = scope->queryFunction(address);
+            if (fd == nullptr) {
+                scope->addFunction(address, "__recovered_" + fields[0]);
+                fd = scope->queryFunction(address);
+            }
+            if (fd == nullptr) throw std::runtime_error("cannot create function");
+            fd->getFuncProto().setPieces(pieces);
+            results << fields[0] << "\tapplied\n";
+        } catch (const std::exception &error) {
+            results << rowTarget << "\trejected\t" << error.what() << "\n";
+        } catch (const ghidra::LowlevelError &error) {
+            results << rowTarget << "\trejected\t" << error.explain << "\n";
+        }
+    }
+    results.flush();
+    fibers::require(bool(results), "Cannot save seed results");
+}
+
+// Standard C library signatures as return type, parameter types, and "..." for varargs.
+// Codes: v void, i int, u unsigned, l long, z size_t, p void *, s char *, d double.
+static const std::unordered_map<std::string, std::string> &importSignatures() {
+    static const std::unordered_map<std::string, std::string> table = {
+        {"printf", "i s ..."}, {"__printf_chk", "i i s ..."}, {"fprintf", "i p s ..."},
+        {"__fprintf_chk", "i p i s ..."}, {"sprintf", "i s s ..."}, {"snprintf", "i s z s ..."},
+        {"__sprintf_chk", "i s i z s ..."}, {"__snprintf_chk", "i s z i z s ..."},
+        {"scanf", "i s ..."}, {"sscanf", "i s s ..."}, {"__isoc99_sscanf", "i s s ..."},
+        {"__isoc99_scanf", "i s ..."}, {"open", "i s i ..."}, {"open64", "i s i ..."},
+        {"puts", "i s"}, {"putchar", "i i"}, {"fputs", "i s p"}, {"fputc", "i i p"},
+        {"fwrite", "z p z z p"}, {"fread", "z p z z p"}, {"fopen", "p s s"}, {"fopen64", "p s s"},
+        {"fclose", "i p"}, {"fflush", "i p"}, {"fileno", "i p"}, {"malloc", "p z"},
+        {"calloc", "p z z"}, {"realloc", "p p z"}, {"free", "v p"}, {"memcpy", "p p p z"},
+        {"__memcpy_chk", "p p p z z"}, {"memmove", "p p p z"}, {"memset", "p p i z"},
+        {"memcmp", "i p p z"}, {"strlen", "z s"}, {"strcmp", "i s s"}, {"strncmp", "i s s z"},
+        {"strcpy", "s s s"}, {"strncpy", "s s s z"}, {"strchr", "s s i"}, {"strrchr", "s s i"},
+        {"strdup", "s s"}, {"strerror", "s i"}, {"atoi", "i s"}, {"strtol", "l s p i"},
+        {"strtoul", "z s p i"}, {"getenv", "s s"}, {"close", "i i"}, {"read", "l i p z"},
+        {"write", "l i p z"}, {"__errno_location", "p"}, {"exit", "v i"}, {"_exit", "v i"},
+        {"abort", "v"}, {"__stack_chk_fail", "v"}, {"__cxa_finalize", "v p"},
+        {"qsort", "v p z z p"}, {"time", "l p"}, {"clock_gettime", "i i p"}, {"sqrt", "d d"}};
+    return table;
+}
+
+static ghidra::Datatype *importType(ghidra::Architecture &arch, char code) {
+    auto *types = arch.types;
+    switch (code) {
+    case 'v': return types->getTypeVoid();
+    case 'i': return types->getBase(4, ghidra::TYPE_INT);
+    case 'u': return types->getBase(4, ghidra::TYPE_UINT);
+    case 'l': return types->getBase(8, ghidra::TYPE_INT);
+    case 'z': return types->getBase(8, ghidra::TYPE_UINT);
+    case 'p': return types->getTypePointer(8, types->getTypeVoid(), 1);
+    case 's': return types->getTypePointer(8, types->getTypeChar(1), 1);
+    case 'd': return types->getBase(8, ghidra::TYPE_FLOAT);
+    }
+    throw std::runtime_error("unknown import type code");
+}
+
+// Without these, calls to imports such as printf lose their arguments in the pseudocode.
+static std::unordered_set<uint64_t> applyImportPrototypes(
+    StaticElfArchitecture &arch, ghidra::Scope *scope, const fibers::Elf &elf,
+    std::unordered_set<uint64_t> &added, uint64_t selectedAddress) {
+    std::unordered_set<uint64_t> applied;
+    auto apply = [&](const std::string &name, uint64_t address) {
+        const auto found = importSignatures().find(name);
+        if (address == selectedAddress || found == importSignatures().end())
+            return;
+        const ghidra::Address entry(arch.getDefaultCodeSpace(), address);
+        if (added.insert(address).second)
+            scope->addFunction(entry, name);
+        auto *function = scope->queryFunction(entry);
+        if (function == nullptr)
+            return;
+        std::istringstream codes(found->second);
+        std::string code;
+        ghidra::PrototypePieces pieces;
+        pieces.model = arch.defaultfp;
+        pieces.firstVarArgSlot = -1;
+        codes >> code;
+        pieces.outtype = importType(arch, code[0]);
+        while (codes >> code) {
+            if (code == "...") {
+                pieces.firstVarArgSlot = static_cast<int>(pieces.intypes.size());
+                break;
+            }
+            pieces.intypes.push_back(importType(arch, code[0]));
+            pieces.innames.push_back("");
+        }
+        function->getFuncProto().setPieces(pieces);
+        applied.insert(address);
+    };
+    for (const auto &symbol : elf.functions())
+        apply(symbol.name, symbol.address);
+    for (const auto &stub : elf.pltStubs())
+        apply(stub.name, stub.address);
+    return applied;
+}
+
+// Without noreturn knowledge, flow after a call such as __stack_chk_fail runs into the
+// next function in memory and merges unrelated functions into one.
+static void markNoReturnCallees(StaticElfArchitecture &arch, ghidra::Scope *scope,
+                                const fibers::Elf &elf, std::unordered_set<uint64_t> &added,
+                                uint64_t selectedAddress) {
+    static const std::unordered_set<std::string> noReturn = {
+        "__stack_chk_fail", "__chk_fail", "__fortify_fail", "__assert_fail", "__assert_perror_fail",
+        "__assert", "abort", "exit", "_exit", "_Exit", "quick_exit", "pthread_exit", "longjmp",
+        "_longjmp", "siglongjmp", "__longjmp_chk", "__cxa_throw", "__cxa_rethrow", "__cxa_bad_cast",
+        "__cxa_bad_typeid", "__cxa_throw_bad_array_new_length", "__libc_fatal", "err", "errx",
+        "verr", "verrx", "_ZSt9terminatev"};
+    auto mark = [&](const std::string &name, uint64_t address) {
+        if (address == selectedAddress || !noReturn.count(name))
+            return;
+        const ghidra::Address entry(arch.getDefaultCodeSpace(), address);
+        if (added.insert(address).second)
+            scope->addFunction(entry, name);
+        if (auto *function = scope->queryFunction(entry))
+            function->getFuncProto().setNoReturn(true);
+    };
+    for (const auto &symbol : elf.functions())
+        mark(symbol.name, symbol.address);
+    for (const auto &stub : elf.pltStubs())
+        mark(stub.name, stub.address);
+}
+
 int main(int argc,char **argv) {
     try {
-        fibers::require(argc==5,"Usage: core-decompile BINARY SPEC_DIRECTORY SYMBOL OUTPUT");
+        fibers::require(argc==5 || argc==6,"Usage: core-decompile BINARY SPEC_DIRECTORY SYMBOL OUTPUT [SEEDS]");
         ghidra::startDecompilerLibrary(std::vector<std::string>{argv[2]});
         fibers::Elf elf(argv[1]);
         const std::string selector=argv[3];
@@ -273,11 +558,15 @@ int main(int argc,char **argv) {
             selectedAddress=std::stoull(selector.substr(3),nullptr,16);
         } else selectedAddress=elf.function(selector).address;
         StaticElfArchitecture arch(argv[1]);ghidra::DocumentStorage store;arch.init(store);
+        // ELF symbols give no body bounds, so a jump to another symbol is a tail call.
+        arch.branch_entry_tailcall=true;
         MappedElfImage* image=static_cast<MappedElfImage*>(arch.loader);
         fibers::require(image->executableAddress(selectedAddress),"Selected address is not file-backed executable code");
         auto scope=arch.symboltab->getGlobalScope();std::unordered_set<uint64_t> added;
         for(const auto& symbol:elf.functions())if(added.insert(symbol.address).second)
             scope->addFunction(ghidra::Address(arch.getDefaultCodeSpace(),symbol.address),symbol.name);
+        const auto imports = applyImportPrototypes(arch, scope, elf, added, selectedAddress);
+        markNoReturnCallees(arch, scope, elf, added, selectedAddress);
         std::unordered_set<uint64_t> dataAddresses;
         for(const auto& symbol:elf.objects()) {
             if(symbol.size>1048576 || !image->dataRange(symbol.address,symbol.size) ||
@@ -292,6 +581,8 @@ int main(int argc,char **argv) {
             std::ostringstream name;name<<"__recovered_"<<std::hex<<selectedAddress;
             scope->addFunction(selected,name.str());
         }
+        std::filesystem::create_directories(argv[4]);
+        if (argc == 6) applyPrototypeSeeds(arch, scope, selectedAddress, argv[5], argv[4], imports);
         auto fd=scope->queryFunction(selected);
         fibers::require(fd!=nullptr,"Cannot create selected function");
         auto action=arch.allacts.getCurrent();auto peel=action->getSubRule("peel_multi_region");
@@ -306,6 +597,22 @@ int main(int argc,char **argv) {
         arch.print->setOutputStream(&out);
         // Export only addresses the decompiler actually resolved; the frontend
         // decides whether the image's relocation state permits using them.
+        std::ofstream prototypes(std::filesystem::path(argv[4]) / "prototype-evidence.tsv");
+        exportPrototype(prototypes, "function", selectedAddress, selectedAddress,
+                        fd->getFuncProto());
+        for (int i = 0; i < fd->numCalls(); ++i) {
+            auto call = fd->getCallSpecs(i);
+            auto op = call->getOp();
+            auto target = call->getEntryAddress();
+            if (op == nullptr) continue;
+            const bool resolved = !target.isInvalid() &&
+                target.getSpace() == arch.getDefaultCodeSpace();
+            exportPrototype(prototypes, resolved ? "call" : "indirect",
+                            op->getAddr().getOffset(),
+                            resolved ? target.getOffset() : 0, *call);
+        }
+        prototypes.flush();
+        fibers::require(bool(prototypes), "Cannot save prototype evidence");
         std::ofstream edges(std::filesystem::path(argv[4])/"recovered-edges.tsv");
         edges << "kind\tsite\ttarget\n";
         for(int i=0;i<fd->numCalls();++i) {

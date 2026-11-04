@@ -2080,7 +2080,13 @@ bool Funcdata::ancestorOpUse(int4 maxlevel,const Varnode *invn,
   }
   case CPUI_CALL:
   case CPUI_CALLIND:
-    return false;		// A call is never a good indication of a single op use
+  {
+    // A call with a locked output prototype really produces the value
+    FuncCallSpecs *fc = getCallSpecs(def);
+    if (fc != (FuncCallSpecs *)0 && fc->isOutputLocked() && def->getOut() == invn)
+      break;
+    return false;		// Otherwise a call is never a good indication of a single op use
+  }
   default:
     break;
   }

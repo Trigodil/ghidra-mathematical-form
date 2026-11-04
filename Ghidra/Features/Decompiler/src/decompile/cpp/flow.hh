@@ -112,6 +112,7 @@ private:
   PcodeOp *fallthruOp(PcodeOp *op) const;		///< Find fallthru pcode-op for given op
   void newAddress(PcodeOp *from,const Address &to);	///< Register a new (non fall-thru) flow target
   void deleteRemainingOps(list<PcodeOp *>::const_iterator oiter);
+  bool isTailcallBranch(PcodeOp *op) const;	///< Is the BRANCH a tail call to another function
   PcodeOp *xrefControlFlow(list<PcodeOp *>::const_iterator oiter,bool &startbasic,bool &isfallthru,FuncCallSpecs *fc);
   bool processInstruction(const Address &curaddr,bool &startbasic);
   void fallthru(void);					///< Process (the next) sequence of instructions in fall-thru order

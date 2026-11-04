@@ -16,6 +16,7 @@ import threading
 import time
 import full_recovery
 import source_project
+import abi_evidence
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_REPO = HERE / 'backend' if (HERE / 'backend').is_dir() else HERE.parents[1]
@@ -253,7 +254,7 @@ class Workflow:
         for source in sorted([*sources, *self.tools.values(), HERE / 're_cli.py', HERE / 'inventory.py',
                               HERE / 'full_recovery.py', HERE / 'recovery_build.py',
                               HERE / 'source_project.py',
-                              HERE / 'global_state.py',
+                              HERE / 'global_state.py', HERE / 'abi_evidence.py',
                               Path('/usr/bin/objdump')]):
             fingerprint.update(str(source).encode())
             fingerprint.update(bytes.fromhex(digest(source)))
@@ -364,6 +365,7 @@ class Workflow:
             row = dict(**item, fingerprint=fingerprint, metadata_backend=self.native_identity)
             (out / 'decompiled.c').unlink(missing_ok=True)
             (out / 'globals.json').unlink(missing_ok=True)
+            (out / 'prototype-evidence.tsv').unlink(missing_ok=True)
             row['decompile'] = self.restricted([self.tools['core-decompile'], source, self.specs,
                                                 item.get('selector', item['name']), out], source, out,
                                                 label=f'decompile {item["name"]} @ 0x{item["address"]:x}')
@@ -504,6 +506,7 @@ class Workflow:
         missing = []
         if spec is None:
             result = self.complete_source_dependencies(source, result)
+            result = self.refine_source_prototypes(source, result)
             spec, missing = full_recovery.decompiler_project(result)
         result['analysis_status'] = result.get('analysis_status', result['status'])
         if spec is None:
@@ -512,7 +515,7 @@ class Workflow:
         else:
             result['full_recovery'] = full_recovery.recover(
                 source, spec, Path(result['output']) / 'full-recovery', run, emit,
-                timeout=self.args.function_timeout, memory=self.args.memory_mb,
+                timeout=self.args.build_timeout, memory=self.args.memory_mb,
                 max_candidates=self.args.recovery_candidates)
             result['full_recovery']['missing_decompiler_functions'] = missing
         result['whole_binary_recovered'] = result['full_recovery']['whole_binary_recovered']
@@ -522,7 +525,126 @@ class Workflow:
         save(Path(result['output']) / 'report.json', result)
         return result
 
-    def complete_source_dependencies(self, source, result):
+    def refine_source_prototypes(self, source, result):
+        """Reanalyze callers with supported callee hypotheses until stable.
+
+        Stability concerns inferred prototypes, not program equivalence."""
+        folder = Path(result['output'])
+        deadline = time.monotonic() + self.args.stage_timeout
+        state = dict(status='running', rounds=[], attempts=0, adopted=0,
+                     equivalence_proved=False)
+        tried = set()
+        artifact_names = ('decompiled.c', 'globals.json', 'prototype-evidence.tsv',
+                          'quality.tsv', 'recovered-edges.tsv', 'prototype-seeds-result.tsv')
+        imports = source_project.link_boundary(source)[1]
+        for round_number in range(self.args.prototype_rounds):
+            plans = abi_evidence.seed_manifests(folder, result['functions'], imports)
+            rows = {row['address']: row for row in result['functions']}
+            pending = []
+            for address, (manifest, evidence) in sorted(plans.items()):
+                if not manifest:
+                    continue
+                identity = hashlib.sha256(
+                    (self.native_identity + '\n' + manifest).encode()
+                ).hexdigest()
+                row = rows[address]
+                if row.get('prototype_seed_sha256') != identity:
+                    pending.append((address, manifest, evidence, identity))
+            if not pending:
+                state['status'] = 'proposal_fixed_point'
+                break
+            round_state = dict(index=round_number, candidates=len(pending), results=[])
+            state['rounds'].append(round_state)
+            changed = False
+            for address, manifest, evidence, identity in pending:
+                if (address, identity) in tried:
+                    continue
+                remaining = deadline - time.monotonic()
+                if (remaining <= 0 or STOP.is_set() or
+                        state['attempts'] >= self.args.recovery_functions):
+                    state['status'] = 'interrupted' if STOP.is_set() else 'budget_exhausted'
+                    break
+                tried.add((address, identity))
+                state['attempts'] += 1
+                output = folder / 'prototype-rounds' / str(round_number) / f'{address:x}'
+                output.mkdir(parents=True, exist_ok=True)
+                for name in artifact_names:
+                    (output / name).unlink(missing_ok=True)
+                seeds = output / 'prototype-seeds.tsv'
+                seeds.write_text(manifest)
+                attempt = dict(address=address, manifest_sha256=identity, evidence=evidence)
+                round_state['results'].append(attempt)
+                attempt['decompile'] = self.restricted(
+                    [self.tools['core-decompile'], source, self.specs,
+                     f'@0x{address:x}', output, seeds], source, output,
+                    min(remaining, self.args.function_timeout),
+                    label=f'refine caller 0x{address:x}',
+                )
+                try:
+                    complete = (attempt['decompile']['status'] == 'ok' and
+                                all((output / name).is_file() for name in artifact_names))
+                    if not complete:
+                        raise ValueError('Incomplete native reanalysis')
+                    seed_results = [line.split('\t') for line in
+                                    (output / 'prototype-seeds-result.tsv').read_text().splitlines()]
+                    expected_targets = set(evidence['candidate_targets'])
+                    if (len(seed_results) != len(expected_targets) or
+                            any(len(fields) != 2 or fields[1] != 'applied'
+                                for fields in seed_results) or
+                            {int(fields[0], 16) for fields in seed_results} != expected_targets):
+                        raise ValueError('Native backend rejected a prototype hypothesis')
+                    flags = dict(line.split('\t') for line in
+                                 (output / 'quality.tsv').read_text().splitlines())
+                    if any(flags.get(key) != '0' for key in
+                           ('unimplemented', 'bad_data', 'unknown_relocation_read')):
+                        raise ValueError('Reanalysis contains unresolved machine operations')
+                    records = abi_evidence.read_evidence(output / 'prototype-evidence.tsv')
+                    own = [entry for entry in records if entry['kind'] == 'function']
+                    if len(own) != 1 or own[0]['target'] != address:
+                        raise ValueError('Reanalysis function identity mismatch')
+                    globals_data = json.loads((output / 'globals.json').read_text())
+                    if globals_data.get('version') != 2:
+                        raise ValueError('Missing native global metadata')
+                except (OSError, ValueError, TypeError, AttributeError) as error:
+                    attempt.update(status='retained_previous', reason=str(error))
+                else:
+                    destination = folder / 'functions' / f'{address:x}'
+                    for name in artifact_names:
+                        temporary = destination / (name + '.new')
+                        shutil.copyfile(output / name, temporary)
+                        temporary.replace(destination / name)
+                    row = rows[address]
+                    row.update(prototype_seed_sha256=identity,
+                               prototype_hypotheses=evidence['candidate_targets'],
+                               metadata_backend=self.native_identity,
+                               unknown_relocation_read=False,
+                               unimplemented_instructions=False, bad_data=False,
+                               decompile=attempt['decompile'])
+                    row['warnings'] = [line.strip() for line in
+                                       (destination / 'decompiled.c').read_text().splitlines()
+                                       if 'WARNING:' in line]
+                    row['status'] = 'partial' if row['warnings'] else 'ok'
+                    save(destination / 'result.json', row)
+                    attempt['status'] = 'adopted_proposal'
+                    state['adopted'] += 1
+                    changed = True
+                save(folder / 'prototype-refinement.json', state)
+            if state['status'] in ('interrupted', 'budget_exhausted'):
+                break
+            if not changed:
+                state['status'] = 'unresolved'
+                break
+            # Propagated signatures may expose additional direct dependencies.
+            result = self.complete_source_dependencies(source, result, deadline, refresh=False)
+        else:
+            state['status'] = 'round_budget_exhausted'
+        state['remaining_evidence'] = abi_evidence.compare(folder, result['functions'])
+        result['prototype_refinement'] = state
+        save(folder / 'prototype-refinement.json', state)
+        save(folder / 'report.json', result)
+        return result
+
+    def complete_source_dependencies(self, source, result, deadline=None, refresh=True):
         """Extend all source proposals to a direct-callee fixed point.
 
         Pseudocode address references are discovery hypotheses. The native
@@ -533,8 +655,13 @@ class Workflow:
         rows = result.setdefault('functions', [])
         known = {row['address']: row for row in rows}
         pending, examined, attempted = set(), set(), set()
-        deadline = time.monotonic() + self.args.stage_timeout
-        state = dict(status='running', attempts=0, new_functions=0, refreshed_functions=0,
+        if deadline is None:
+            deadline = time.monotonic() + self.args.stage_timeout
+        # Non-refresh passes carry counters over from the previous result.
+        previous = {} if refresh else result.get('source_dependencies', {})
+        state = dict(status='running', attempts=previous.get('attempts', 0),
+                     new_functions=previous.get('new_functions', 0),
+                     refreshed_functions=previous.get('refreshed_functions', 0),
                      flow_completeness_proved=False, pending=[], failed=[])
         for row in rows:
             directory = folder / 'functions' / f'{row["address"]:x}'
@@ -543,11 +670,10 @@ class Workflow:
                                     and row.get('metadata_backend') == self.native_identity)
             except (OSError, ValueError, AttributeError):
                 current_metadata = False
+            # The analysis pass has already decompiled every row of a fresh run.
             if not (directory / 'decompiled.c').is_file():
                 state['failed'].append(row['address'])
-                if self.args.fresh:
-                    pending.add(row['address'])
-            elif self.args.fresh or not current_metadata:
+            elif refresh and not current_metadata:
                 pending.add(row['address'])
 
         def scan_row(row):
@@ -583,12 +709,19 @@ class Workflow:
             out.mkdir(parents=True, exist_ok=True)
             (out / 'decompiled.c').unlink(missing_ok=True)
             (out / 'globals.json').unlink(missing_ok=True)
+            (out / 'prototype-evidence.tsv').unlink(missing_ok=True)
             refreshing = address in known
-            row = dict(address=address, name=f'__recovered_{address:x}', size=0,
-                       selector=f'@0x{address:x}', provenance=['pseudocode_call_candidate'],
-                       metadata_backend=self.native_identity)
+            # A refreshed row keeps its name, size and provenance; only the
+            # decompiler-derived fields below are replaced.
+            row = known[address] if refreshing else dict(
+                address=address, name=f'__recovered_{address:x}', size=0,
+                selector=f'@0x{address:x}', provenance=['pseudocode_call_candidate'])
+            for stale in ('decompile', 'warnings', 'unknown_relocation_read', 'unimplemented_instructions',
+                          'bad_data', 'resumed', 'prototype_seed_sha256', 'prototype_hypotheses'):
+                row.pop(stale, None)
+            row['metadata_backend'] = self.native_identity
             row['decompile'] = self.restricted([self.tools['core-decompile'], source, self.specs,
-                row['selector'], out], source, out, min(remaining, self.args.function_timeout),
+                f'@0x{address:x}', out], source, out, min(remaining, self.args.function_timeout),
                 label=f'recover callee 0x{address:x}')
             row['status'] = row['decompile']['status']
             text_path = out / 'decompiled.c'
@@ -601,16 +734,13 @@ class Workflow:
                 if quality.is_file():
                     flags = dict(line.split('\t') for line in quality.read_text().splitlines())
                     row['unknown_relocation_read'] = flags.get('unknown_relocation_read') != '0'
+                    row['unimplemented_instructions'] = flags.get('unimplemented') != '0'
+                    row['bad_data'] = flags.get('bad_data') != '0'
                     if flags.get('unimplemented') == '1' or flags.get('bad_data') == '1' or row['warnings']:
                         if row['status'] == 'ok':
                             row['status'] = 'partial'
                 state['refreshed_functions' if refreshing else 'new_functions'] += 1
-            if address in known:
-                previous = known[address]
-                previous.clear()
-                previous.update(row)
-                row = previous
-            else:
+            if not refreshing:
                 rows.append(row)
             known[address] = row
             if address in state['failed']:
@@ -656,11 +786,12 @@ class Workflow:
             destination.unlink(missing_ok=True)
             if source_file.is_file():
                 shutil.copyfile(source_file, destination)
-            metadata_source = source_file.parent / 'globals.json'
-            metadata_destination = destination.parent / 'globals.json'
-            metadata_destination.unlink(missing_ok=True)
-            if metadata_source.is_file():
-                shutil.copyfile(metadata_source, metadata_destination)
+            for name in ('globals.json', 'prototype-evidence.tsv'):
+                metadata_source = source_file.parent / name
+                metadata_destination = destination.parent / name
+                metadata_destination.unlink(missing_ok=True)
+                if metadata_source.is_file():
+                    shutil.copyfile(metadata_source, metadata_destination)
         result.update(output=str(folder), whole_binary_recovered=False,
                       imported_analysis=str(self.args.reuse_analysis.resolve()),
                       imported_analysis_sha256=self.previous_analysis_hash, target_unchanged=True)
@@ -733,6 +864,7 @@ def main(argv=None):
     parser.add_argument('-o', '--output', type=Path, help='Results directory outside the checkout')
     parser.add_argument('-j', '--jobs', type=int, default=2)
     parser.add_argument('--function-timeout', type=float, default=30)
+    parser.add_argument('--build-timeout', type=float, default=120)
     parser.add_argument('--cpu-seconds', type=int, default=20)
     parser.add_argument('--stage-timeout', type=float, default=300)
     parser.add_argument('--memory-mb', type=int, default=2048, help='Per-worker memory ceiling')
@@ -743,9 +875,12 @@ def main(argv=None):
     parser.add_argument('--recovery-candidates', type=int, default=64, help='Whole-project build budget per binary (default: 64)')
     parser.add_argument('--recovery-functions', type=int, default=100000,
                         help='Missing-callee discovery budget; --stage-timeout bounds the whole stage')
+    parser.add_argument('--prototype-rounds', type=int, default=3,
+                        help='Maximum rounds of supported cross-function prototype propagation')
     parser.add_argument('--version', action='version', version=VERSION)
     args = parser.parse_args(argv)
-    if (args.jobs < 1 or args.cpu_seconds < 1 or args.memory_mb < 128 or args.recovery_candidates < 1 or args.recovery_functions < 1
+    if (args.jobs < 1 or args.cpu_seconds < 1 or args.memory_mb < 128 or args.recovery_candidates < 1 or args.recovery_functions < 1 or args.prototype_rounds < 1
+            or not math.isfinite(args.build_timeout) or args.build_timeout <= 0
             or not math.isfinite(args.function_timeout) or args.function_timeout <= 0
             or not math.isfinite(args.stage_timeout) or args.stage_timeout <= 0):
         parser.error('Jobs/CPU/timeouts must be positive and memory must be at least 128 MiB')

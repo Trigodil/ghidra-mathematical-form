@@ -249,6 +249,18 @@ void FlowInfo::deleteRemainingOps(list<PcodeOp *>::const_iterator oiter)
   }
 }
 
+/// \brief Check if the given BRANCH targets the entry of a different known function
+/// \param op is the BRANCH op
+/// \return \b true if the architecture treats the branch as a tail call
+bool FlowInfo::isTailcallBranch(PcodeOp *op) const
+
+{
+  if (!glb->branch_entry_tailcall) return false;
+  const Address &destaddr( op->getIn(0)->getAddr() );
+  if (destaddr.isConstant() || destaddr == data.getAddress()) return false;
+  return data.getScopeLocal()->getParent()->queryFunction(destaddr) != (Funcdata *)0;
+}
+
 /// \brief Analyze control-flow within p-code for a single instruction
 ///
 /// Walk through the raw p-code (from the given iterator to the end of the list)
@@ -274,6 +286,15 @@ PcodeOp *FlowInfo::xrefControlFlow(list<PcodeOp *>::const_iterator oiter,bool &s
     if (startbasic) {
       data.opMarkStartBasic(op);
       startbasic = false;
+    }
+    if (op->code() == CPUI_BRANCH && isTailcallBranch(op)) {
+      // Treat a jump to another function entry as CALL followed by RETURN.
+      data.opSetOpcode(op,CPUI_CALL);
+      PcodeOp *ret = data.newOp(1,op->getAddr());
+      data.opSetOpcode(ret,CPUI_RETURN);
+      data.opSetInput(ret,data.newConstant(1,0),0);
+      data.opDeadInsertAfter(ret,op);
+      oiter = ret->getInsertIter();
     }
     switch(op->code()) {
     case CPUI_CBRANCH:
