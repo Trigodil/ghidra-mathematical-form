@@ -70,6 +70,69 @@ IMPORT_RETURNS = {
               'backtrace_symbols',
 }
 IMPORT_RETURN = {name: ctype for ctype, names in IMPORT_RETURNS.items() for name in names.split()}
+# Real parameters, variadic calls make gcc zero eax.
+_P, _S = 'void *', 'unsigned long'
+IMPORT_PARAMS = {
+    'free': _P, 'malloc': _S, 'calloc': f'{_S}, {_S}', 'realloc': f'{_P}, {_S}',
+    'memcpy': f'{_P}, const void *, {_S}', 'memmove': f'{_P}, const void *, {_S}',
+    'memset': f'{_P}, int, {_S}', 'memcmp': f'const void *, const void *, {_S}',
+    '__memcpy_chk': f'{_P}, const void *, {_S}, {_S}', '__memset_chk': f'{_P}, int, {_S}, {_S}',
+    'strlen': 'const char *', 'strcmp': 'const char *, const char *',
+    'strncmp': f'const char *, const char *, {_S}', 'strchr': 'const char *, int',
+    'strrchr': 'const char *, int', 'strstr': 'const char *, const char *',
+    'strcpy': 'char *, const char *', 'strdup': 'const char *', 'strerror': 'int',
+    'getenv': 'const char *', '__isoc23_strtol': 'const char *, char **, int',
+    'exit': 'int', 'abort': 'void', 'perror': 'const char *', 'raise': 'int',
+    '__stack_chk_fail': 'void', '__assert_fail': 'const char *, const char *, unsigned int, const char *',
+    '__errno_location': 'void', 'sysconf': 'int', 'clock': 'void', 'isatty': 'int',
+    'close': 'int', 'fclose': _P, 'fflush': _P, 'fileno': _P, 'feof': _P, 'ferror': _P,
+    'fopen': 'const char *, const char *', 'fdopen': 'int, const char *',
+    'fread': f'{_P}, {_S}, {_S}, {_P}', 'fwrite': f'const void *, {_S}, {_S}, {_P}',
+    '__fread_chk': f'{_P}, {_S}, {_S}, {_S}, {_P}', 'fseek': f'{_P}, long, int', 'ftell': _P,
+    'fgets': f'char *, int, {_P}', '__fgets_chk': f'char *, {_S}, int, {_P}',
+    'fputs': f'const char *, {_P}', 'fputc': f'int, {_P}', 'getc': _P,
+    'setvbuf': f'{_P}, char *, int, {_S}', 'remove': 'const char *',
+    'stat': f'const char *, {_P}', 'lstat': f'const char *, {_P}', 'fstat': f'int, {_P}',
+    'chmod': 'const char *, unsigned int', 'fchmod': 'int, unsigned int',
+    'chown': 'const char *, unsigned int, unsigned int', 'fchown': 'int, unsigned int, unsigned int',
+    'mkdir': 'const char *, unsigned int', 'utimensat': f'int, const char *, {_P}, int',
+    'opendir': 'const char *', 'readdir': _P, 'closedir': _P,
+    'mmap': f'{_P}, {_S}, int, int, int, long', 'munmap': f'{_P}, {_S}',
+    'clock_gettime': f'int, {_P}', 'setpriority': 'int, unsigned int, int',
+    'qsort': f'{_P}, {_S}, {_S}, {_P}', 'backtrace': f'{_P}, int', 'backtrace_symbols': f'{_P}, int',
+    '__sysv_signal': f'int, {_P}',
+    **{n: _P for n in ('pthread_mutex_lock', 'pthread_mutex_unlock', 'pthread_mutex_destroy',
+                       'pthread_cond_signal', 'pthread_cond_broadcast', 'pthread_cond_destroy')},
+    'pthread_mutex_init': f'{_P}, const void *', 'pthread_cond_init': f'{_P}, const void *',
+    'pthread_cond_wait': f'{_P}, {_P}', 'pthread_create': f'{_P}, const void *, {_P}, {_P}',
+    'pthread_join': f'{_S}, void **',
+}
+
+
+def call_arities(name, text):
+    counts = set()
+    for m in re.finditer(rf'\b{re.escape(name)}\s*\(', text):
+        depth, n, i, empty = 1, 1, m.end(), True
+        while i < len(text) and depth:
+            c = text[i]
+            depth += (c in '([{') - (c in ')]}')
+            n += c == ',' and depth == 1
+            empty &= c.isspace() or (c == ')' and depth == 0)
+            i += 1
+        counts.add(0 if empty else n)
+    return counts
+
+
+def import_decl(name, text=''):
+    # Variadic if a call site disagrees.
+    params = IMPORT_PARAMS.get(name, '...')
+    want = 0 if params == 'void' else params.count(',') + 1
+    if params != '...' and call_arities(name, text) - {want}:
+        params = '...'
+    return f'extern {IMPORT_RETURN.get(name, "long")} {name}({params});'
+
+
+USEROPS.update({name: import_decl(name) for name in ('abort', 'exit', '__assert_fail', '__stack_chk_fail')})
 # Defined by the hosted C start files (Scrt1.o, crti.o, crtbeginS.o, crtn.o), which
 # the compiler driver links again; emitting them would define them twice.
 PLT_SECTIONS = {'.plt', '.plt.sec', '.plt.got'}
@@ -747,14 +810,14 @@ def assemble(binary_report):
         else:
             # Array typedefs let unresolved odd-width pointers and prototypes declare.
             aliases.append(f'typedef {"signed" if signed else "unsigned"} char {name}[{width}];')
-    aliases.extend(USEROPS[t] for t in sorted(tokens & USEROPS.keys()))
+    masked = code_mask(source)
+    aliases.extend(import_decl(t, masked) if t in IMPORT_PARAMS else USEROPS[t] for t in sorted(tokens & USEROPS.keys()))
     if 'in_FS_OFFSET' in tokens:
         aliases.append('static inline uint64_t __recovery_fs_base(void) { uint64_t b; '
                        '__asm__("mov %%fs:0, %0" : "=r"(b)); return b; }')
     # Imports the decompiler already names are referenced too; none has a body here.
     called_imports |= (tokens & set(imports.values())) - set(definitions.values())
-    aliases.extend(f'extern {IMPORT_RETURN.get(name, "long")} {name}(...);'
-                   for name in sorted(called_imports - USEROPS.keys()))
+    aliases.extend(import_decl(name, masked) for name in sorted(called_imports - USEROPS.keys()))
     header = '\n'.join(aliases + implementations + [slice_helpers(w) for w in sorted(slice_widths)] + [odd_width_helper(w) for w in sorted(odd_widths)] + ['#endif', ''])
     globals_source, global_metadata = global_state.recover(base, binary_report.get('functions', []), definitions,
                                                               code_mask(source), image)
