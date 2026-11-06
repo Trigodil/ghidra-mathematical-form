@@ -1356,8 +1356,10 @@ void MapState::gatherOpen(const Funcdata &fd)
     ct = addbase[i].base->getType();
     if (ct->getMetatype() == TYPE_PTR) {
       ct = ((TypePointer *)ct)->getPtrTo();
-      while(ct->getMetatype() == TYPE_ARRAY)
-	ct = ((TypeArray *)ct)->getBase();
+      if (ct->getMetatype() != TYPE_ARRAY || ct->getSize() <= 1)
+	while(ct->getMetatype() == TYPE_ARRAY)
+	  ct = ((TypeArray *)ct)->getBase();
+      // A pointer to a sized array keeps its extent as the minimum size of the open range
     }
     else
       ct = (Datatype *)0;	// Do unknown array

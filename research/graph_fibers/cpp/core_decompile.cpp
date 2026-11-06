@@ -8,6 +8,8 @@
 #include <iostream>
 #include <cctype>
 #include <iomanip>
+#include <memory>
+#include <set>
 
 // All ELF segments are data read through mmap(PROT_READ), never dlopen/exec.
 class MappedElfImage : public ghidra::LoadImage {
@@ -127,6 +129,31 @@ public:
             return true;
         }
         return false;
+    }
+    // Instruction bytes without relocation tainting; shorter at the end of a segment.
+    size_t codeBytes(uint64_t address,uint8_t* out,size_t size) const {
+        for(const auto& p:segments) {
+            if(!(p.p_flags&PF_X) || address<p.p_vaddr || address-p.p_vaddr>=p.p_filesz) continue;
+            size_t count=std::min<uint64_t>(size,p.p_filesz-(address-p.p_vaddr));
+            std::memcpy(out,data.data()+p.p_offset+(address-p.p_vaddr),count);
+            return count;
+        }
+        return 0;
+    }
+    // Bytes of a NUL-terminated read-only string at an address, or empty when none.
+    std::string stringAt(uint64_t address,size_t limit) const {
+        for(const auto& p:segments) {
+            if((p.p_flags&(PF_X|PF_W)) || address<p.p_vaddr || address-p.p_vaddr>=p.p_filesz) continue;
+            const char* begin=reinterpret_cast<const char*>(data.data()+p.p_offset+(address-p.p_vaddr));
+            size_t room=std::min<uint64_t>(limit,p.p_filesz-(address-p.p_vaddr));
+            for(size_t i=0;i<room;++i) {
+                unsigned char c=begin[i];
+                if(c==0) return i?std::string(begin,i+1):std::string();
+                if(!(c>=32&&c<127) && c!='\n' && c!='\t') return {};
+            }
+            return {};
+        }
+        return {};
     }
     bool executableAddress(uint64_t address) const {
         for(const auto& p:segments)
@@ -253,17 +280,131 @@ static void exportGlobals(ghidra::Architecture& arch,ghidra::Funcdata& function,
     }
     metadata<<"]}\n";metadata.close();fibers::require(bool(metadata),"Cannot save global metadata");
 }
+// A varnode that moves when an instruction is decoded at a displaced address was computed from
+// the instruction pointer, so it is an address reference rather than an integer.
+class RipProvenance {
+    struct Window : ghidra::LoadImage {
+        uint64_t base=0;uint8_t bytes[16]={};
+        Window():LoadImage("instruction window"){}
+        void loadFill(ghidra::uint1 *out,ghidra::int4 size,const ghidra::Address& a) override {
+            for(int i=0;i<size;++i) {uint64_t off=a.getOffset()+i-base;out[i]=off<16?bytes[off]:0;}
+        }
+        std::string getArchType() const override{return "x86-64";}
+        void adjustVma(long) override{throw ghidra::LowlevelError("VMA adjustment unsupported");}
+    };
+    struct Capture : ghidra::PcodeEmit {
+        std::vector<ghidra::VarnodeData> items;
+        void dump(const ghidra::Address&,ghidra::OpCode opcode,ghidra::VarnodeData *out,
+                  ghidra::VarnodeData *in,ghidra::int4 count) override {
+            calls|=opcode==ghidra::CPUI_CALL || opcode==ghidra::CPUI_CALLIND;
+            // A branch destination is a control transfer, not an operand.
+            const int first=(opcode==ghidra::CPUI_BRANCH || opcode==ghidra::CPUI_CBRANCH)?1:0;
+            if(out) items.push_back(*out);
+            for(int i=first;i<count;++i) items.push_back(in[i]);
+        }
+        bool calls=false;
+    };
+    static constexpr uint64_t displacement=0x10000000;
+    MappedElfImage& image;Window window;ghidra::ContextInternal context;
+    ghidra::Sleigh sleigh;ghidra::DocumentStorage documents;
+    std::unordered_set<uint64_t> scanned;
+    bool decode(uint64_t at,uint64_t base,const uint8_t* bytes,Capture& capture) {
+        window.base=base;std::memcpy(window.bytes,bytes,16);
+        try {sleigh.oneInstruction(capture,ghidra::Address(sleigh.getDefaultCodeSpace(),at));return true;}
+        catch(const ghidra::LowlevelError&) {return false;}
+    }
+public:
+    struct Reference { uint64_t site,target;bool constant; };
+    std::vector<Reference> references;
+    std::unordered_set<uint64_t> constants;
+    bool isTarget(uint64_t value) const { return constants.count(value)!=0; }
+    RipProvenance(MappedElfImage& img,const std::string& sla):image(img),sleigh(&window,&context) {
+        std::string escaped;
+        for(char ch:sla) escaped+=ch=='&'?"&amp;":ch=='<'?"&lt;":std::string(1,ch);
+        std::istringstream xml("<sleigh>"+escaped+"</sleigh>");
+        auto *root=documents.parseDocument(xml)->getRoot();documents.registerTag(root);
+        sleigh.initialize(documents);
+        context.setVariableDefault("addrsize",2);context.setVariableDefault("opsize",1);
+        context.setVariableDefault("rexprefix",0);context.setVariableDefault("longMode",1);
+    }
+    void scan(uint64_t site) {
+        if(!scanned.insert(site).second) return;
+        uint8_t bytes[16]={};
+        if(image.codeBytes(site,bytes,16)==0) return;
+        Capture here,moved;
+        if(!decode(site,site,bytes,here) || !decode(site+displacement,site+displacement,bytes,moved)) return;
+        // Calls push their own return address; that is not a reference to data or code.
+        if(here.calls || here.items.size()!=moved.items.size()) return;
+        for(size_t i=0;i<here.items.size();++i) {
+            const auto &a=here.items[i],&b=moved.items[i];
+            const bool constant=a.space->getType()==ghidra::IPTR_CONSTANT;
+            if(a.space!=b.space || a.size!=b.size || a.size<4 || a.size>8 || (!constant && a.space!=sleigh.getDefaultDataSpace())) continue;
+            const uint64_t mask=a.size==8?~uint64_t(0):((uint64_t(1)<<(8*a.size))-1);
+            if(((b.offset-a.offset)&mask)!=displacement) continue;
+            references.push_back({site,a.offset,constant});
+            if(constant) constants.insert(a.offset&mask);
+        }
+    }
+};
 class StaticElfArchitecture : public ghidra::SleighArchitecture {
+    std::string sla;
+    std::set<uint64_t> defined;
     void buildLoader(ghidra::DocumentStorage&) override {
         collectSpecFiles(std::cerr);loader=new MappedElfImage(getFilename());
     }
     void postSpecFile() override {
         ghidra::Architecture::postSpecFile();
-        static_cast<MappedElfImage*>(loader)->attach(getDefaultCodeSpace());
+        auto* image=static_cast<MappedElfImage*>(loader);
+        image->attach(getDefaultCodeSpace());
+        provenance=std::make_unique<RipProvenance>(*image,sla);
+    }
+    // Strings become char arrays and other data a byte array up to the next object or target,
+    // so the decompiler's own pointer inference resolves constants there to references.
+    void defineTargets(const std::set<uint64_t>& targets) {
+        auto* image=static_cast<MappedElfImage*>(loader);
+        auto* scope=symboltab->getGlobalScope();
+        uint64_t covered=0;
+        for(auto it=targets.begin();it!=targets.end();++it) {
+            const uint64_t target=*it;
+            ghidra::Address where(getDefaultDataSpace(),target);
+            auto* existing=scope->findContainer(where,1,ghidra::Address());
+            if(!image->dataRange(target,1) || !defined.insert(target).second ||
+               (existing && existing->getAddr()==where)) continue;
+            std::string text=image->stringAt(target,4096);
+            uint64_t size;ghidra::Datatype* type;
+            if(!text.empty()) {size=text.size();type=types->getTypeArray(size,types->getTypeChar(1));covered=target+size;}
+            else {
+                auto next=std::upper_bound(objectStarts.begin(),objectStarts.end(),target);
+                size=std::min<uint64_t>(next==objectStarts.end()?4096:*next-target,4096);
+                auto following=std::next(it);
+                if(following!=targets.end()) size=std::min<uint64_t>(size,*following-target);
+                while(size>1 && !image->dataRange(target,size)) --size;
+                type=size==1?types->getBase(1,ghidra::TYPE_UNKNOWN):
+                    types->getTypeArray(size,types->getBase(1,ghidra::TYPE_UNKNOWN));
+            }
+            std::ostringstream name;name<<(text.empty()?"__recovery_object_":"__recovery_string_")<<std::hex<<target;
+            scope->addSymbol(name.str(),type,where,ghidra::Address());
+        }
+    }
+    bool isAddressConstant(ghidra::uintb value) const override {
+        return provenance->isTarget(value);
+    }
+    void flowTraced(ghidra::Funcdata& fd) override {
+        std::set<uint64_t> sites;
+        for(auto it=fd.beginOpAlive();it!=fd.endOpAlive();++it) sites.insert((*it)->getAddr().getOffset());
+        const size_t before=provenance->references.size();
+        for(auto site:sites) provenance->scan(site);
+        std::set<uint64_t> targets;
+        for(size_t i=before;i<provenance->references.size();++i)
+            if(provenance->references[i].constant) targets.insert(provenance->references[i].target);
+        defineTargets(targets);
     }
 public:
-    explicit StaticElfArchitecture(const std::string& file)
-        :SleighArchitecture(file,"x86:LE:64:default:gcc",&std::cerr){}
+    std::vector<uint64_t> objectStarts;
+    std::unique_ptr<RipProvenance> provenance;
+    StaticElfArchitecture(const std::string& file,const std::string& specs)
+        :SleighArchitecture(file,"x86:LE:64:default:gcc",&std::cerr),
+         sla(std::filesystem::absolute(std::filesystem::path(specs)/"x86-64.sla").string()) {}
 };
 // Encode only fully described primitive and pointer types. Unknown and
 // aggregate types are explicitly unsupported for prototype seeding.
@@ -472,7 +613,8 @@ static void applyPrototypeSeeds(StaticElfArchitecture &arch, ghidra::Scope *scop
 }
 
 // Standard C library signatures as return type, parameter types, and "..." for varargs.
-// Codes: v void, i int, u unsigned, l long, z size_t, p void *, s char *, d double.
+// Codes: v void, i int, u unsigned, l long, z size_t, p void *, s char *, d double,
+// pN pointer to an N byte output buffer (such as struct stat).
 static const std::unordered_map<std::string, std::string> &importSignatures() {
     static const std::unordered_map<std::string, std::string> table = {
         {"printf", "i s ..."}, {"__printf_chk", "i i s ..."}, {"fprintf", "i p s ..."},
@@ -491,13 +633,19 @@ static const std::unordered_map<std::string, std::string> &importSignatures() {
         {"strtoul", "z s p i"}, {"getenv", "s s"}, {"close", "i i"}, {"read", "l i p z"},
         {"write", "l i p z"}, {"__errno_location", "p"}, {"exit", "v i"}, {"_exit", "v i"},
         {"abort", "v"}, {"__stack_chk_fail", "v"}, {"__cxa_finalize", "v p"},
-        {"qsort", "v p z z p"}, {"time", "l p"}, {"clock_gettime", "i i p"}, {"sqrt", "d d"}};
+        {"qsort", "v p z z p"}, {"time", "l p"}, {"clock_gettime", "i i p"},
+        {"stat", "i s p144"}, {"stat64", "i s p144"}, {"lstat", "i s p144"}, {"lstat64", "i s p144"},
+        {"fstat", "i i p144"}, {"fstat64", "i i p144"}, {"sqrt", "d d"}};
     return table;
 }
 
-static ghidra::Datatype *importType(ghidra::Architecture &arch, char code) {
+static ghidra::Datatype *importType(ghidra::Architecture &arch, const std::string &token) {
     auto *types = arch.types;
-    switch (code) {
+    if (token.size() > 1 && token[0] == 'p') {
+        auto *bytes = types->getBase(1, ghidra::TYPE_UNKNOWN);
+        return types->getTypePointer(8, types->getTypeArray(std::stoi(token.substr(1)), bytes), 1);
+    }
+    switch (token[0]) {
     case 'v': return types->getTypeVoid();
     case 'i': return types->getBase(4, ghidra::TYPE_INT);
     case 'u': return types->getBase(4, ghidra::TYPE_UINT);
@@ -531,13 +679,13 @@ static std::unordered_set<uint64_t> applyImportPrototypes(
         pieces.model = arch.defaultfp;
         pieces.firstVarArgSlot = -1;
         codes >> code;
-        pieces.outtype = importType(arch, code[0]);
+        pieces.outtype = importType(arch, code);
         while (codes >> code) {
             if (code == "...") {
                 pieces.firstVarArgSlot = static_cast<int>(pieces.intypes.size());
                 break;
             }
-            pieces.intypes.push_back(importType(arch, code[0]));
+            pieces.intypes.push_back(importType(arch, code));
             pieces.innames.push_back("");
         }
         function->getFuncProto().setPieces(pieces);
@@ -590,7 +738,7 @@ int main(int argc,char **argv) {
                 "Invalid hexadecimal address selector");
             selectedAddress=std::stoull(selector.substr(3),nullptr,16);
         } else selectedAddress=elf.function(selector).address;
-        StaticElfArchitecture arch(argv[1]);ghidra::DocumentStorage store;arch.init(store);
+        StaticElfArchitecture arch(argv[1],argv[2]);ghidra::DocumentStorage store;arch.init(store);
         // ELF symbols give no body bounds, so a jump to another symbol is a tail call.
         arch.branch_entry_tailcall=true;
         MappedElfImage* image=static_cast<MappedElfImage*>(arch.loader);
@@ -602,6 +750,7 @@ int main(int argc,char **argv) {
         markNoReturnCallees(arch, scope, elf, added, selectedAddress);
         std::unordered_set<uint64_t> dataAddresses;
         for(const auto& symbol:elf.objects()) {
+            arch.objectStarts.push_back(symbol.address);
             if(symbol.size>1048576 || !image->dataRange(symbol.address,symbol.size) ||
                !dataAddresses.insert(symbol.address).second) continue;
             bool word=symbol.size==1 || symbol.size==2 || symbol.size==4 || symbol.size==8 || symbol.size==16;
@@ -609,6 +758,7 @@ int main(int argc,char **argv) {
                 arch.types->getTypeArray(symbol.size,arch.types->getBase(1,ghidra::TYPE_UNKNOWN));
             scope->addSymbol(symbol.name,type,ghidra::Address(arch.getDefaultDataSpace(),symbol.address),ghidra::Address());
         }
+        std::sort(arch.objectStarts.begin(),arch.objectStarts.end());
         ghidra::Address selected(arch.getDefaultCodeSpace(),selectedAddress);
         if(added.insert(selectedAddress).second) {
             std::ostringstream name;name<<"__recovered_"<<std::hex<<selectedAddress;
@@ -646,6 +796,14 @@ int main(int argc,char **argv) {
         }
         prototypes.flush();
         fibers::require(bool(prototypes), "Cannot save prototype evidence");
+        // Operands computed from the instruction pointer, with the decoder's own account of them.
+        std::ofstream rip(std::filesystem::path(argv[4])/"rip-references.tsv");
+        rip << "site\ttarget\tkind\tregion\n";
+        for(const auto& reference:arch.provenance->references)
+            rip << std::hex << reference.site << "\t" << reference.target << "\t"
+                << (reference.constant?"address":"memory") << "\t"
+                << (image->executableAddress(reference.target)?"code":image->dataRange(reference.target,1)?"data":"other") << "\n";
+        rip.close(); fibers::require(bool(rip),"Cannot save RIP references");
         std::ofstream edges(std::filesystem::path(argv[4])/"recovered-edges.tsv");
         edges << "kind\tsite\ttarget\n";
         for(int i=0;i<fd->numCalls();++i) {

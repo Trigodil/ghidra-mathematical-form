@@ -108,7 +108,9 @@ def signature(text):
     # Vector types are words in the emitted definition, so the prototype must say the same.
     prefix = lower_vectors(masked[:brace].strip())[0]
     match = re.fullmatch(r'([A-Za-z_][A-Za-z_0-9\s*]*?)\b([A-Za-z_][A-Za-z_0-9]*)\s*\(([^;{}]*)\)', prefix)
-    if not match or '(' in match[3] or ')' in match[3]:
+    # Pointer-to-array parameters such as (*param_2) [144] are plain declarators.
+    params = re.sub(r'\(\s*\*\s*\w+\s*\)\s*\[\s*\d+\s*\]', '', match[3]) if match else ''
+    if not match or '(' in params or ')' in params:
         return None
     return match[2], prefix
 
@@ -194,6 +196,16 @@ VECTOR_ELEMENT = r'(?:xunknown1|undefined1)'
 HELPER_CALLEE = re.compile(r'(?:CONCAT|SUB|SEXT|ZEXT|CARRY|SCARRY|SBORROW)\d+|POPCOUNT|LZCOUNT')
 
 
+def element_address(text, match, name):
+    """Decay p[k] to its address unless it is the whole 16 byte value of an assignment or return."""
+    before, after = text[:match.start()].rstrip(), text[match.end():].lstrip()
+    if re.search(r'\*\s*\)$', before):
+        return f'((xunknown1 *)&{name}[{match[1]}])'
+    if re.match(r'=(?!=)', after) or re.search(r'(?<![=!<>+\-*/%&|^])=$|\breturn$', before):
+        return match[0]
+    return f'((xunknown1 *)&{name}[{match[1]}])'
+
+
 def lower_vectors(text):
     """Lower the array type xunknown1 [16] to the word xunknown16 (unsigned __int128).
 
@@ -212,6 +224,9 @@ def lower_vectors(text):
     def decays(name, source):
         for use in re.finditer(rf'\b{name}\b', source):
             before, after = source[:use.start()].rstrip(), source[use.end():].lstrip()
+            # A word cast to a pointer type can only mean the array's address.
+            if re.search(r'\(\s*[A-Za-z_][\w\s]*\*[\s*]*\)$', before):
+                return True
             if before[-1:] in '(,' and after[:1] in ',)':
                 depth, index = 0, len(before) - 1
                 while index >= 0:
@@ -226,10 +241,26 @@ def lower_vectors(text):
         return False
 
     words = set(pointers)
+    buffers = []
     for match in re.finditer(VECTOR_ELEMENT + r'\s+([A-Za-z_]\w*)\s*\[\s*(3|5|6|7|9|1[0-6])\s*\]\s*;', masked):
         if not decays(match[1], masked[:match.start()] + masked[match.end():]):
             edits.append((match.start(), match.end(), f'{ctype(int(match[2]))} {match[1]};'))
             words.add(match[1])
+        else:
+            buffers.append(match)
+    # A buffer that is also copied whole to or from a word keeps its address; the copy is explicit.
+    for match in buffers:
+        name = re.escape(match[1])
+        zero = re.compile(r'\(\s*' + VECTOR_ELEMENT + r'\s*\[\s*(\d+)\s*\]\s*\)\s*0x0\s*')
+        copies = [(m.start(), m.end(), f'__builtin_memset({match[1]}, 0, {zero.fullmatch(m[1])[1]});' if zero.fullmatch(m[1])
+                   else f'__builtin_memcpy({match[1]}, &(__typeof__({m[1]})){{{m[1]}}}, sizeof({m[1]}));')
+                  for m in re.finditer(rf'(?m)^[ \t]*{name}[ \t]*=(?!=)[ \t]*([^;{{}}]+);', masked)]
+        copies += [(m.start(), m.end(), f'__builtin_memcpy(&({m[1]}), {match[1]}, sizeof({m[1]}));')
+                   for m in re.finditer(rf'(?m)^[ \t]*([A-Za-z_]\w*)[ \t]*=[ \t]*{name};', masked)]
+        if copies:
+            # The word is 16 bytes, so the buffer must hold one whole.
+            edits.append((match.start(), match.end(), f'xunknown1 {match[1]} [16];'))
+            edits.extend(copies)
     for start, end, value in sorted(edits, reverse=True):
         text = text[:start] + value + text[end:]
     # Byte indexing: p[k][i] and (*p)[i] on a pointer, w[i] on a word.
@@ -238,6 +269,8 @@ def lower_vectors(text):
         if name in pointers:
             text = re.sub(rf'\(\s*\*\s*{escaped}\s*\)\s*\[', f'((xunknown1 *){name})[', text)
             text = re.sub(rf'\b{escaped}\s*\[([^\[\]]*)\]\s*\[', rf'((xunknown1 *)&{name}[\1])[', text)
+            # A bare element p[k] is an array that decays to the address of that element.
+            text = re.sub(rf'(?<![\w.&]){escaped}\s*\[([^\[\]]*)\]', lambda m: element_address(text, m, name), text)
         else:
             text = re.sub(rf'(?<![\w.&]){escaped}\s*\[', f'((xunknown1 *)&{name})[', text)
     return text, sorted(words)
@@ -459,6 +492,113 @@ def lower_odd_widths(text):
     return local.sub(declare, text), widths
 
 
+FRAME_LOCAL = re.compile(r'^([ \t]+)(?P<type>[A-Za-z_]\w*(?:[ \t]+[A-Za-z_]\w*)*?[ \t]*\*?)(?:[ \t]+|(?<=\*))'
+                         r'(?P<name>[A-Za-z]*Stack_(?P<off>[0-9a-f]+))[ \t]*(?:\[[ \t]*(?P<count>\d+)[ \t]*\])?[ \t]*;[ \t]*$', re.M)
+FRAME_WIDENED = re.compile(r'^[ \t]+struct \{ (?P<type>[\w ]+?) value__; (?:xunknown1 pad\[(?P<pad>\d+)\]; )?\} '
+                           r'(?P<name>[A-Za-z]*Stack_(?P<off>[0-9a-f]+)__w);[ \t]*$', re.M)
+FRAME_TYPE_SIZE = re.compile(r'(?:u?int|xunknown|undefined|unkbyte|unkuint|unkint)(\d+)|(bool|char)|float(\d)')
+
+
+FRAME_STDINT = re.compile(r'u?int(?:8|16|32|64)_t')
+
+
+def type_size(kind):
+    """Return the size of a stack local type, or None for one not understood."""
+    kind = re.sub(r'\s+', ' ', kind.strip()).replace(' *', '*')
+    if kind.endswith('*'):
+        return 8
+    if kind in ('__int128', 'unsigned __int128'):
+        return 16
+    if FRAME_STDINT.fullmatch(kind):
+        return int(re.search(r'\d+', kind)[0]) // 8
+    match = FRAME_TYPE_SIZE.fullmatch(kind)
+    if match is None:
+        return None
+    return int(match[1] or match[3] or 1)
+
+
+def lower_frame(text):
+    """Gather stack locals into one struct at their frame offsets when an address escapes.
+
+    Adjacent stack objects are one memory block to the code; separate C locals let a
+    pointer or callee run past its own object. Offsets come from the Stack_ names.
+    """
+    mask = code_mask(text)
+    fields = []
+    for pattern in (FRAME_LOCAL, FRAME_WIDENED):
+        for m in pattern.finditer(mask):
+            if m['type'].split()[0] in ('return', 'goto', 'else', 'case'):
+                continue
+            widened = pattern is FRAME_WIDENED
+            base = type_size(m['type'])
+            if base is None:
+                return text, dict(reason='unsized_local')
+            size = base + int(m['pad'] or 0) if widened else base * int(m['count'] or 1)
+            fields.append(dict(span=(m.start(), m.end()), name=m['name'], offset=int(m['off'], 16),
+                               size=size, align=16 if 'int128' in m['type'] else min(base, 8) if base < 16 else 1, text=text[m.start():m.end()].strip(),
+                               array=bool(not widened and m['count'])))
+    if not fields:
+        return text, None
+    names = '|'.join(re.escape(n) for n in sorted((f['name'] for f in fields), key=len, reverse=True))
+    uses = [u for u in re.finditer(rf'(?<![\w.>])({names})\b', mask)
+            if not any(f['span'][0] <= u.start() < f['span'][1] for f in fields)]
+    by_name = {f['name']: f for f in fields}
+
+    def escapes(use):
+        before = mask[:use.start()].rstrip()
+        if before.endswith('&') and not before.endswith('&&'):
+            # Unary unless an operand precedes it; a parenthesized type is a cast, not an operand.
+            if not re.search(r'[\w\]]\s*&$', before) and (
+                    not before[:-1].rstrip().endswith(')') or re.search(r'\(\s*[A-Za-z_][\w\s*]*\)\s*&$', before)):
+                return True
+        return by_name[use[1]]['array'] and not mask[use.end():].lstrip().startswith('[')
+    if not any(escapes(u) for u in uses):
+        return text, None
+    fields.sort(key=lambda f: -f['offset'])
+    # An object at 8 modulo 16 below the return address is 16-aligned, so the struct starts there.
+    start = fields[0]['offset'] + (8 - fields[0]['offset']) % 16
+    for f in fields:
+        f['position'] = start - f['offset']
+    fields.sort(key=lambda f: (f['position'], -f['size']))
+    clusters = []
+    for f in fields:
+        # Locals the decompiler overlaps share storage, so they become a union.
+        if clusters and f['position'] < clusters[-1]['end']:
+            clusters[-1]['fields'].append(f)
+            clusters[-1]['end'] = max(clusters[-1]['end'], f['position'] + f['size'])
+        else:
+            clusters.append(dict(position=f['position'], end=f['position'] + f['size'], fields=[f]))
+    members, cursor, packed = [], 0, False
+    for cluster in clusters:
+        if cluster['position'] > cursor:
+            members.append(f'xunknown1 gap__{cursor}[{cluster["position"] - cursor}];')
+        if len(cluster['fields']) == 1:
+            f = cluster['fields'][0]
+            packed = packed or f['position'] % f['align'] != 0
+            members.append(f['text'])
+        else:
+            packed = True
+            inner = []
+            for f in cluster['fields']:
+                gap = f['position'] - cluster['position']
+                inner.append('struct { ' + (f'xunknown1 pad__{f["position"]}[{gap}]; ' if gap else '') + f['text'] +
+                             ' } __attribute__((packed));')
+            members.append('union { ' + ' '.join(inner) +
+                           f' xunknown1 extent__{cluster["position"]}[{cluster["end"] - cluster["position"]}]; }};')
+        cursor = cluster['end']
+    declaration = '  struct {\n' + ''.join(f'    {m}\n' for m in members) + '  } __attribute__((' + ('packed, ' if packed else '') + 'aligned(16))) frame__;'
+    # The frame as an asm operand lets a callee reach every member through any member address.
+    declaration += '\n  __asm__ volatile("" : : "r"(&frame__) : "memory");'
+    edits = [(u.start(), u.end(), 'frame__.' + u[1]) for u in uses]
+    first = min(f['span'][0] for f in fields)
+    for f in fields:
+        begin, end = f['span']
+        edits.append((begin, end + 1 if text[end:end + 1] == '\n' else end, declaration + '\n' if begin == first else ''))
+    for begin, end, value in sorted(edits, reverse=True):
+        text = text[:begin] + value + text[end:]
+    return text, dict(frame_locals=len(fields), frame_size=start)
+
+
 def odd_width_helper(width):
     return (
         f'static inline {ctype(width)} __recovery_load{width}(const void *p) {{\n'
@@ -510,6 +650,16 @@ def call_imports(text, imports):
         lambda m: rename(m) + '(' if int(m[1], 16) in imports else m[0], text), used
 
 
+def lower_pointer_floats(text):
+    """Store a pointer into a float-typed slot bitwise; a C cast would convert, or not compile."""
+    def store(match):
+        indent, target, value = match.groups()
+        if value[0] != '"' and not re.search(rf'\*\s*{value}\s*[;,\[]', text):
+            return match.group(0)
+        return f'{indent}__builtin_memcpy(&({target}), &(void *){{{value}}}, sizeof(void *));'
+    return re.sub(r'^(\s*)([^=;{}\n]+?) = \(float8\)("(?:[^"\\\n]|\\.)*"|[A-Za-z_]\w*);$', store, text, flags=re.M)
+
+
 def assemble(binary_report):
     base = Path(binary_report['output'])
     bodies, missing, definitions, prototypes = [], [], {}, []
@@ -548,11 +698,14 @@ def assemble(binary_report):
             match = re.fullmatch(r'(?:func_0x|__recovered_)([0-9a-fA-F]{1,16})', word)
             if match and int(match[1],16) in definitions:
                 renames[word] = definitions[int(match[1],16)]
-    transformed, slice_widths, odd_widths, storage = [], set(), set(), []
+    transformed, slice_widths, odd_widths, storage, frames = [], set(), set(), [], []
     for address, text in bodies:
         lowered, vectors = lower_vectors(replace_identifiers(text, renames))
         lowered, used, detail = lower_storage(lowered)
-        lowered, odd_used = lower_odd_widths(initialize_tls_base(lowered))
+        lowered, odd_used = lower_odd_widths(initialize_tls_base(lower_pointer_floats(lowered)))
+        lowered, frame = lower_frame(lowered)
+        if frame:
+            frames.append(dict(address=address, **frame))
         transformed.append(lowered)
         odd_widths.update(odd_used)
         slice_widths.update(used)
@@ -621,7 +774,7 @@ def assemble(binary_report):
                     helper_implementations=[name for name in required if name not in unsupported],
                     unsupported_helpers=unsupported,
                     unparsed_signatures=[address for address, _ in bodies if address not in definitions],
-                    renamed_identifiers=renames, storage_lowering=storage,
+                    renamed_identifiers=renames, storage_lowering=storage, frame_lowering=frames,
                     slice_widths=sorted(slice_widths), odd_widths_lowered=sorted(odd_widths),
                     unresolved_odd_width_types=sorted(t for t in tokens if re.fullmatch(r'unk(?:u)?int\d+', t)),
                     global_state=global_metadata,

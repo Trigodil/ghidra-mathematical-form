@@ -1130,7 +1130,8 @@ MapEntry *ActionConstantPtr::isPointer(AddrSpace *spc,Varnode *vn,PcodeOp *op,in
       FuncCallSpecs *fc = data.getCallSpecs(op);
       if (fc != (FuncCallSpecs *)0 && fc->isInputLocked() && fc->numParams() > slot-1) {
 	type_metatype meta = fc->getParam(slot-1)->getType()->getMetatype();
-	if (meta != TYPE_PTR && meta != TYPE_UNKNOWN) {
+	// A constant computed as an address stays one when the callee types the word as an integer
+	if (meta != TYPE_PTR && meta != TYPE_UNKNOWN && !glb->isAddressConstant(vn->getOffset())) {
 	  return (MapEntry *)0;	// Definitely not passing a pointer
 	}
       }
@@ -1233,11 +1234,20 @@ int4 ActionConstantPtr::apply(Funcdata &data)
     if (vn->isSpacebase()) continue; // Don't use constant 0 which is already spacebase
     //    if (vn->getSize() != rspc->getAddrSize()) continue; // Must be size of pointer
 
-    PcodeOp *op = vn->loneDescend();
-    if (op == (PcodeOp *)0) continue;
-    AddrSpace *rspc = selectInferSpace(vn, op, glb->inferPtrSpaces);
-    if (rspc == (AddrSpace *)0) continue;
+    // A constant shared by several reads is judged at each read, as its readers may differ
+    vector<PcodeOp *> readers(vn->beginDescend(),vn->endDescend());
+    for(int4 r=0;r<readers.size();++r) {
+    PcodeOp *op = readers[r];
     int4 slot = op->getSlot(vn);
+    Varnode *cur = vn;
+    if ((op->code() == CPUI_CALL || op->code() == CPUI_CALLIND) && slot > 0 && vn->getSize() < glb->getDefaultDataSpace()->getAddrSize() &&
+	glb->isAddressConstant(vn->getOffset())) {
+      // A pushed address read back as a narrow stack slot is still the whole address
+      cur = data.newConstant(glb->getDefaultDataSpace()->getAddrSize(),vn->getOffset());
+      data.opSetInput(op,cur,slot);
+    }
+    AddrSpace *rspc = selectInferSpace(cur, op, glb->inferPtrSpaces);
+    if (rspc == (AddrSpace *)0) continue;
     OpCode opc = op->code();
     if (opc == CPUI_INT_ADD) {
       if (op->getIn(1-slot)->isSpacebase()) continue; // Make sure other side is not a spacebase already
@@ -1246,12 +1256,13 @@ int4 ActionConstantPtr::apply(Funcdata &data)
       continue;
     Address rampoint;
     uintb fullEncoding;
-    entry = isPointer(rspc,vn,op,slot,rampoint,fullEncoding,data);
+    entry = isPointer(rspc,cur,op,slot,rampoint,fullEncoding,data);
     if (entry != (MapEntry *)0) {
-      data.spacebaseConstant(op,slot,entry,rampoint,fullEncoding,vn->getSize());
+      data.spacebaseConstant(op,slot,entry,rampoint,fullEncoding,cur->getSize());
       if ((opc == CPUI_INT_ADD)&&(slot==1))
 	data.opSwapInput(op,0,1);
       count += 1;
+    }
     }
   }
   return 0;

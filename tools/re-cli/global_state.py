@@ -15,6 +15,7 @@ import struct
 MAX_OBJECT = 1024 * 1024
 MAX_TOTAL = 16 * 1024 * 1024
 NAME = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+RECOVERED_OBJECT = re.compile(r"__recovery_(?:object|string)_[0-9a-f]+")
 INTEGER_TYPES = {
     "byte": 1,
     "char": 1,
@@ -213,6 +214,12 @@ def recover(base, rows, functions=None, source="", image=None):
                     raise ValueError("pointer_target_disagrees_with_bytes")
                 record.pop("type_name", None)
                 previous = records.get(name)
+                if previous is not None and RECOVERED_OBJECT.fullmatch(name):
+                    # Extents come from per-function evidence, so the longest view of an address wins.
+                    if record["size"] > previous["size"]:
+                        consumed += record["size"] - previous["size"]
+                        records[name] = record
+                    continue
                 if previous is not None:
                     ignored = {"pointer_target", "pointer_target_is_code", "conflict"}
                     same = {k: v for k, v in previous.items() if k not in ignored} == {

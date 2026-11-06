@@ -39,7 +39,7 @@ public:
     return new ActionStart(getGroup());
   }
   virtual int4 apply(Funcdata &data) {
-    data.startProcessing(); return 0; }
+    data.startProcessing(); data.getArch()->flowTraced(data); return 0; }
 };
 
 /// \brief Do any post-processing after decompilation

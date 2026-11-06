@@ -2083,8 +2083,9 @@ bool Funcdata::ancestorOpUse(int4 maxlevel,const Varnode *invn,
   {
     // A call with a locked output prototype really produces the value
     FuncCallSpecs *fc = getCallSpecs(def);
+    // Other readers of the value do not stop it also being returned
     if (fc != (FuncCallSpecs *)0 && fc->isOutputLocked() && def->getOut() == invn)
-      break;
+      return true;
     return false;		// Otherwise a call is never a good indication of a single op use
   }
   default:
