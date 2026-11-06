@@ -292,6 +292,207 @@ No lattice order on prototypes is claimed under which $\Phi$ is monotone, so con
 Let $\mathtt{leaf}(x,y) = x + y$ take $x$ in $\mathrm{EDI}$ and $y$ in $\mathrm{ESI}$, and suppose the caller sets only $\mathrm{EDI} = 7$ before the call. In its first decompilation, the caller sees one argument. With $m(\mathtt{caller}) = \{(\mathtt{leaf}, \delta(\mathtt{leaf}))\}$, the call becomes binary, and the forwarded $\mathrm{ESI}$ appears as a caller parameter. A hypothesis assigning the first argument to the wrong register is rejected because of the storage mismatch. On rerun, $\eta^\ast = \eta$ and no reanalysis occurs; corrupting $\eta^\ast$ triggers exactly one reanalysis, which restores the same $\eta$.
 \end{example}
 
+\section{Translation unit fibers}
+
+At high optimisation levels, inlining, cloning and interprocedural register allocation couple the functions in a translation unit. This section examines how much the compiler fiber still decomposes into per-function pieces.
+
+\subsection{Summary locality}
+
+Express the source space as a product $S = S_1 \times \dots \times S_m$ with one slot for each function, grouping functions that are inlined into one another into a shared slot. Let $N(j)$ denote the call-graph neighbours of slot $j$. Each slot has a finite summary set $A_j$, which records facts such as purity, the noreturn property, clobbered registers, propagated constants and memory effects. Set $A = A_1 \times \dots \times A_m$ and denote by $a_{N(j)}$ the restriction of $a \in A$ to the neighbours of $j$.
+
+\begin{definition}[Summary locality]
+There are maps $\sigma_j$ from $S_j \times \prod_{i \in N(j)} A_i$ to $A_j$ and $F_j$ from $S_j \times \prod_{i \in N(j)} A_i$ to byte strings such that, for every $s \in S$, the system
+\[
+  a_j = \sigma_j(s_j, a_{N(j)}), \qquad j = 1, \dots, m,
+\]
+has exactly one solution $a(s) \in A$, and the bytes of function $j$ are $C(s)_j = F_j(s_j, a(s)_{N(j)})$.
+\end{definition}
+
+\begin{definition}
+For a target $b = (b_1, \dots, b_m)$ and $a \in A$, define the \emph{local fiber} of slot $j$ by
+\[
+  L_j(a) = \{ s_j \in S_j : \sigma_j(s_j, a_{N(j)}) = a_j \text{ and } F_j(s_j, a_{N(j)}) = b_j \}.
+\]
+\end{definition}
+
+\begin{theorem}\label{thm:tu-product}
+Under summary locality,
+\[
+  C^{-1}(b) = \bigsqcup_{a \in A} \; \prod_{j=1}^m L_j(a).
+\]
+\end{theorem}
+
+\begin{proof}
+Let $s \in C^{-1}(b)$ and set $a = a(s)$. Then $a$ solves the system and $F_j(s_j, a_{N(j)}) = b_j$ for every $j$, hence $s_j \in L_j(a)$. Conversely, suppose $s_j \in L_j(a)$ for every $j$. The first condition in $L_j(a)$ implies that $a$ solves the system for $s$, so uniqueness gives $a = a(s)$, and the second condition then yields $C(s)_j = b_j$. The union is disjoint since $a(s)$ is a function of $s$.
+\end{proof}
+
+\begin{corollary}
+For a fixed $a$, searching the product requires $\sum_j |\Omega_j|$ candidate checks rather than $\prod_j |\Omega_j|$, where $\Omega_j$ is the candidate set for slot $j$. A summary is \emph{observable} if it is determined by $b$; examples include a clobber set read from the callee bytes or a constant-propagation clone exposed as a symbol. If all summaries are observable, only one $a$ is possible, and the search is linear in $m$.
+\end{corollary}
+
+\begin{proposition}
+Suppose some summaries are unobservable, the call graph has treewidth $w$, and $|A_j| \le \alpha$ for every $j$. Then deciding whether $C^{-1}(b)$ is nonempty and finding one of its elements take $O(m \cdot \alpha^{w+1} \cdot \max_j |\Omega_j|)$ local checks.
+\end{proposition}
+
+\begin{proof}
+Every constraint in the system and every byte condition involves only slot $j$ and its neighbours. Thus, the constraints form a network over variables $a_j$ whose primal graph is the call graph. Take a tree decomposition of width $w$. Elimination along this decomposition enumerates at most $\alpha^{w+1}$ assignments for each bag, and tests the slots in each assignment against at most $\max_j |\Omega_j|$ candidates. The decomposition has $O(m)$ bags.
+\end{proof}
+
+For fixed $w$ and $\alpha$, the bound is polynomial in the number of functions. It offers no improvement for $|\Omega_j|$, which remains exponential in the number of holes in a single function.
+
+\begin{remark}[Refutation test]
+Summary locality predicts that changing slot $j$ while keeping $a$ fixed leaves $C(s)_i$ unchanged for $i \neq j$. A change to function $i$ can therefore be explained only if it occupies slot $j$, neighbours a changed function in the call graph, or has a changed inlining decision.
+\end{remark}
+
+\subsection{Global inlining}
+
+gcc's interprocedural inliner greedily processes call edges from a priority queue, $e$, ordered by badness $\beta_e$. Each edge is also subject to per-caller limits, represented by an indicator $\lambda_e \in \{0, 1\}$, and a unit budget
+\[
+  B(s) = (1 + p) \max(N(s), L), \qquad N(s) = \sum_j n_j(s_j),
+\]
+where $p$ is the inline-unit-growth parameter, $L$ is large-unit-insns, and $n_j$ is the size estimate for slot $j$. For a fixed processing order, an edge $e$ with growth $g_e$ is included in the decision set $D(s)$ exactly when
+\[
+  \lambda_e = 1 \quad \text{and} \quad N(s) + \sum_{f \in D(s),\, f \prec e} g_f + g_e \le B(s).
+\]
+
+\begin{proposition}
+Extend summary locality so that $\sigma_j$ and $F_j$ may also depend on $D$, and assume that $D(s)$ is a function of $s$. Then
+\[
+  C^{-1}(b) = \bigsqcup_{(a, D)} \Big\{ s \in \prod_{j=1}^m L_j(a, D) : D(s) = D \Big\}.
+\]
+\end{proposition}
+
+\begin{proof}
+Theorem~\ref{thm:tu-product} applies by the same argument, with $(a, D)$ replacing $a$. The only condition that does not decompose over slots is $D(s) = D$, which remains as a filter.
+\end{proof}
+
+For a fixed order, the filter is a set of linear inequalities over the integers $n_j$ and $g_e$. It is conjectured, but not proved, that a dynamic program over the slots that tracks prefix sums can decide the filter in pseudo-polynomial time in $B$. Two issues remain open. The order compares $\beta_e$ across all edges, allowing up to $|E|!$ possible orders, while gcc recalculates $g_e$ after each inlining and $B$ uses the original size. It is unknown whether the entire order must be fixed, or whether it suffices to fix, for each rejected edge, the set of edges preceding it.
+
+\subsection{Indicator functions and spectra}
+
+Represent a set of sources by its indicator function. Over $\F_2$, Theorem~\ref{thm:tu-product} becomes
+\[
+  \mathbf{1}_{C^{-1}(b)} = \sum_{a \in A} \prod_{j=1}^m \mathbf{1}_{L_j(a)},
+\]
+This holds at every $s$ where the system has a unique solution, and may fail otherwise. The $\F_2$ affine hull of a set gives parity invariants through Gaussian elimination, but is not the same as the real affine hull. For example, $X = \{000, 110, 101, 011\}$ is an $\F_2$ hyperplane but has full affine rank over $\mathbb{R}$.
+
+Assign each slot a graph $G_j$ on $S_j$, and take their Cartesian product $G = G_1 \,\square\, \dots \,\square\, G_m$. Its Laplacian eigenvectors are tensor products of eigenvectors from the factors, with eigenvalues given by addition. For the hypercube $Q_n = K_2 \,\square\, \dots \,\square\, K_2$, the Walsh characters $\chi_T$ have eigenvalue $2|T|$. Over $\mathbb{R}$, the spectral coefficient of $\mathbf{1}_{C^{-1}(b)}$ at $T = (T_1, \dots, T_m)$ is $\sum_a \prod_j$ of the coefficient of $\mathbf{1}_{L_j(a)}$ at $T_j$, again whenever $a(s)$ is unique.
+
+\begin{proposition}
+Let $\mathcal{L}$ be the Laplacian of a finite graph, with orthonormal eigenvectors $v_k$ and eigenvalues $\lambda_k$. Let $X$ be a vertex set and write $\mathbf{1}_X = \sum_k c_k v_k$. Then
+\[
+  \sum_k \lambda_k c_k^2 = |\partial X|,
+\]
+is the number of edges with exactly one endpoint in $X$. On $Q_n$, taking $\hat f(T) = 2^{-n} \sum_x f(x) (-1)^{T \cdot x}$, this becomes $|\partial X| = 2^{n+1} \sum_T |T| \, \hat{\mathbf{1}}_X(T)^2$.
+\end{proposition}
+
+\begin{proof}
+$\mathbf{1}_X^\top \mathcal{L} \mathbf{1}_X = \sum_{\{x,y\} \in E} (\mathbf{1}_X(x) - \mathbf{1}_X(y))^2$, where each summand is $1$ for a cut edge and $0$ otherwise. On $Q_n$, the characters are orthogonal with $\|\chi_T\|^2 = 2^n$, so $c_T^2 = 2^n \hat{\mathbf{1}}_X(T)^2$ and $\lambda_T = 2|T|$.
+\end{proof}
+
+\subsection{Slot by slot search}
+
+First, read the relocations and call targets. These determine the call graph and all observable summaries before the search begins. Then restrict the slots one by one to their local fibers, following an elimination order along the call graph. Each step checks an exact equality, so no point in the fiber is discarded; the cost depends on the width of the order. This is sound only if the summaries fixed in advance are genuinely functions of $b$. Uniqueness of $a(s)$ is the sole hypothesis that neither reading the references first nor ordering the slots can provide.
+
+\subsection{Locality on real gcc}
+
+The refutation test used gcc 15.2 at -O3 on two zstd 1.5.6 translation units. Compiling the preprocessed units reproduces the shipped object code for 20 of 20 functions in huf\_compress and 147 of 147 in zstd\_compress. In turn, a probe—a single store to a static volatile variable—was inserted at the start of each definition, and every function was compared with relocations masked.
+
+\begin{itemize}
+  \item huf\_compress: 125 changes in the probed slot, 11 at neighbours, 0 from inlining and 4 unexplained. The 4 lie two calls away from the probe, across a function whose bytes do not change, and disappear under -fno-ipa-modref. A memory effect summary therefore passes through a function without changing its bytes. This is consistent with summary locality, but the summary is not observable.
+  \item zstd\_compress: 1146 changes in the probed slot, 174 at neighbours, 296 from inlining, 22 unexplained and 31 added or removed symbols, mostly part and cold splits. Of the inlining changes, 288 come from one call site in ZSTD\_CCtxParams\_setParameter that sits on an inlining threshold and flips with almost any size change elsewhere.
+\end{itemize}
+
+Global coupling does occur, but it is concentrated in a few marginal call sites, leaving $D$ with few free bits in practice. Because a probe deliberately introduces a side effect, these counts may exaggerate the impact of an edit that preserves the summaries.
+
+\section{Thermodynamics of destroyed information}
+
+Compilation discards information. The sources
+\[
+  \texttt{int f(void) \char123{} return 42; \char125} \qquad \text{and} \qquad \texttt{int f(void) \char123{} int x = 999; return 42; \char125}
+\]
+compile to identical bytes and therefore belong to the same fiber; nothing computed from those bytes can identify which source was written. This section models the fiber as the ground state of a statistical system and asks which aspects of the source remain.
+
+\subsection{Gibbs measures on the source space}
+
+Fix a target $b$, a distance $d$ between byte strings that is $d(x, y) = 0$ only for $x = y$, and a graph $G$ on $S$ with edges representing single edits. For $s \in S$, define
+\[
+  u(s) = \#\{ s' : s' \sim s \text{ in } G,\; C(s') \neq C(s) \},
+\]
+as the number of neighbours that compile differently, and let $|s|$ denote the size of $s$. The energy is
+\[
+  E(s) = d(C(s), b) + \mu\, u(s) + \lambda |s|,
+\]
+and the Gibbs measure at temperature $T > 0$ is $p_T(s) = Z_T^{-1} \exp(-E(s)/T)$.
+
+The value $u(s)$ depends only on the neighbourhood of $s$, and
+\[
+  \sum_{s \in X} u(s) = |\partial X| \quad \text{for } X = C^{-1}(C(s)),
+\]
+Thus, $u$ is the pointwise version of the boundary count.
+
+\begin{remark}[Where the topology enters]
+$p_T$ depends on $G$ only through $u$. Without the term $\mu u$, the equilibrium measure is identical for every graph on $S$; the graph then influences only the dynamics. A Metropolis chain on a connected $G$ with symmetric proposals has $p_T$ as its stationary law, while $G$ determines its mixing rate and where it becomes trapped. In what follows, the dynamics encodes the global topology and the energy encodes the local topology.
+\end{remark}
+
+\begin{remark}[Size]
+$S$ is infinite because the dead store above can be repeated with any constant. Consequently, $Z_T$ diverges unless there is a size term or a size cap. With $\lambda > 0$, the limit $T \to 0$ selects the shortest elements of the fiber, treating destroyed parts as absent, as in a minimum description length principle.
+\end{remark}
+
+\subsection{Soundness of the low temperature limit}
+
+\begin{proposition}\label{prop:scaling}
+Let $S$ be finite, $C^{-1}(b) \neq \emptyset$, and define $\mu = \rho T$ and $\lambda = \ell T$ using constants $\rho, \ell \ge 0$. Then, as $T \to 0$, the measure $p_T$ converges to
+\[
+  p_0(s) \propto \mathbf{1}[C(s) = b] \, \exp(-\rho\, u(s) - \ell |s|),
+\]
+whose support is the entire fiber. If instead $\mu > 0$ is fixed, $p_T$ concentrates on the minimisers of $d(C(s), b) + \mu u(s)$. In general, these do not include every point in the fiber and may exclude all of them.
+\end{proposition}
+
+\begin{proof}
+Under this scaling, $\exp(-E(s)/T) = \exp(-d(C(s), b)/T) \exp(-\rho u(s) - \ell |s|)$. The second factor is independent of $T$ and is positive. The first is $1$ on the fiber and no greater than $\exp(-\delta/T)$ elsewhere, where $\delta > 0$ is the smallest nonzero value of $d$ on the finite set $C(S)$. If $\mu$ is fixed, the exponent $-E/T$ reaches its maximum precisely at the minimisers of $E$, and these points carry all the mass in the limit.
+\end{proof}
+
+\subsection{What can be recovered}
+
+Write $s \approx s'$ if $C(s) = C(s')$. The destroyed part of $s$ is its equivalence class in $S/{\approx}$, and its size up to $n$ is quantified by
+\[
+  H_n(b) = \log_2 \big| C^{-1}(b) \cap \{ s : |s| \le n \} \big|.
+\]
+The data processing inequality says that no function of $b$ contains more information about $s$ than $b$; therefore, the conditional entropy $H(s \mid b)$ is a hard lower bound. The terms $\mu u$ and $\lambda |s|$ select a representative of the class. They serve as a prior and recover no information from the binary.
+
+Erasure at -O3 is not invariably complete. Dead code that remains until the interprocedural passes is still included in size estimates and summaries, and can shift a marginal inlining decision in another function.
+
+\begin{definition}
+Consider $s \approx s'$ at the single-function level. The pair is \emph{tier 1} if $s$ and $s'$ remain equivalent in every translation-unit context; it is \emph{tier 2} if some context distinguishes them. Sources that compile differently on their own form a tier 3 pair.
+\end{definition}
+
+The experiments below disprove the conjecture that tier 2 information affects the bytes only through $D$, and point to the following hypothesis.
+
+\begin{remark}[Conjecture]
+In a translation-unit context, $H(s \mid b_{\mathrm{TU}}) = H(s \mid b_f, a, D)$, where $b_f$ denotes the bytes of the function itself and $(a, D)$ its extended summary.
+\end{remark}
+
+\subsection{Global topology of the fiber}
+
+The fiber may divide into several components within $G$. At low temperature, a chain can move between components only by crossing an energy barrier $\Delta$, which takes time of order $\exp(\Delta/T)$. The relevant invariant is the component structure of the sublevel sets $\{ s : E(s) \le t \}$ as $t$ changes—in other words, the persistence of $H_0$. A fiber component born at level $0$ and merging at level $\Delta$ forms a finite bar $[0, \Delta)$. The chain's spectral gap and the Cheeger constant of $G$ weighted by $p_T$ bound the mixing time.
+
+\subsection{Experiments}
+
+All experiments were run with gcc 15.2 at -O3. They are small, exhaustive tests, not measurements on zstd.
+
+\paragraph{Dead code fibers.} Four base functions—a constant return, a loop sum, a call wrapper and a branch—were given up to two insertions selected from fifteen kinds of dead code, yielding 964 sources in total. Every source compiles to the bytes of its base function, so each base fiber contains 241 points and $H_2 = 7.91$ bits. Twelve of the fifteen kinds, among them dead loops, dead arrays and branches rendered dead by inlining a helper, leave no trace even in the interprocedural size summary and are therefore tier 1. The exceptions are branches guarded by a static variable that is never written. They retain their size in the summary because the compiler only discovers that the variable is never written during the interprocedural passes. They account for $1.69$ of the $7.91$ bits, and a caller close to the inlining threshold recovers between $1.62$ and $1.68$ of those bits. None are recovered for the constant base, which is always inlined.
+
+\paragraph{Exact thermodynamics.} The loop-sum base, with the fifteen dead kinds and five live edits and at most two insertions, produces $421$ sources in $27$ byte classes. Inserting, deleting or replacing one insertion defines $G$, whose maximum degree is $59$; $d$ is the byte edit distance.
+\begin{itemize}
+  \item Proposition~\ref{prop:scaling} is borne out. For the base target, whose fiber has $242$ points, scaling $\mu = \rho T$ retains all $242$ in the limit, whereas every tested fixed $\mu$ retains exactly one. For a second target, the fixed value $\mu = 10$ shifts the ground state entirely outside the fiber.
+  \item The translation unit reveals more than $D$. With a caller at three inlining thresholds, $H(s \mid b_{\mathrm{TU}})$ is lower than $H(s \mid b_f, D)$ by between $0.26$ and $0.83$ bits. In one case, the function bytes are identical and both calls are inlined, yet the caller is $321$ bytes long in one instance and $501$ in the other. The dead guard makes the callee impure from the caller's perspective, preventing the caller from merging its two calls. This information is in a summary in $a$, not in a bit of $D$.
+  \item The base fiber has two components in $G$: a large component with $241$ points and an isolated point, giving one finite bar $[0, 33)$. At the isolated point, the live edit \texttt{a \^{}= 3} is applied twice. The edits cancel, amounting to algebraic erasure rather than dead code, and every neighbour of that point compiles differently. The chain's spectral gap drops from $7.6 \times 10^{-2}$ at $T = 30$ to $5.4 \times 10^{-7}$ at $T = 3$, and is numerically zero below $T = 1$. For the second target, the fiber is connected, has no finite bar, and the gap remains at $8.5 \times 10^{-3}$ as $T \to 0$.
+\end{itemize}
+
+\paragraph{Recovery.} Taking each of the $421$ sources in turn as the hidden truth, the most probable element under the limit measure always compiles to the target bytes. It matches the hidden source in $6.4$ percent of cases when only the function bytes are observed, and in $9.5$ percent when the translation unit is observed. It preserves the same live edits in $91.4$ and $92.9$ percent of cases. The mean remaining entropy is $6.33$ and $5.22$ bits, respectively. An annealed Metropolis chain, run $1200$ times from random starting points for $4000$ steps each, ends at a source with the target bytes in $99.5$ percent of runs.
+
+These figures describe a toy space for one function and cannot, on their own, predict recovery from a real binary, where finding any candidate in the first place is the hard part.
 \section{Limitations}
 
 All results in these notes are proved with respect to the machine model $\Sigma$ and a supplied, rather than inferred, ABI. Accordingly, box containment, the fibers of Section 3 and the loop invariants of Section 7 make no claims about faults, page permissions, concurrency or timing. They hold only if the binary actually uses the stated calling convention.
