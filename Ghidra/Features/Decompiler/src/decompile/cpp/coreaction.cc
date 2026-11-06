@@ -2029,6 +2029,32 @@ void ActionReturnRecovery::buildReturnOutput(ParamActive *active,PcodeOp *retop,
   }
 }
 
+// True if vn is copied from a LOAD at a stack pointer offset (spill not heritaged yet)
+static bool isPendingStackLoad(const Varnode *vn,const Funcdata &data)
+
+{
+  while(vn->isWritten() && vn->getDef()->code() == CPUI_COPY)
+    vn = vn->getDef()->getIn(0);
+  if (!vn->isWritten() || vn->getDef()->code() != CPUI_LOAD) return false;
+  vn = vn->getDef()->getIn(1);
+  while(vn->isWritten()) {		// Follow the pointer back to the stack pointer
+    const PcodeOp *op = vn->getDef();
+    OpCode opc = op->code();
+    if (opc == CPUI_COPY)
+      vn = op->getIn(0);
+    else if (opc == CPUI_INT_ADD && op->getIn(0)->isConstant())
+      vn = op->getIn(1);
+    else if ((opc == CPUI_INT_ADD || opc == CPUI_INT_SUB) && op->getIn(1)->isConstant())
+      vn = op->getIn(0);
+    else
+      return false;
+  }
+  AddrSpace *stackspc = data.getArch()->getStackSpace();
+  if (stackspc == (AddrSpace *)0 || !vn->isInput()) return false;
+  const VarnodeData &base(stackspc->getSpacebase(0));
+  return vn->getSpace() == base.space && vn->getOffset() == base.offset;
+}
+
 int4 ActionReturnRecovery::apply(Funcdata &data)
 
 {
@@ -2042,6 +2068,8 @@ int4 ActionReturnRecovery::apply(Funcdata &data)
     int4 maxancestor = data.getArch()->trim_recurse_max;
     iterend = data.endOp(CPUI_RETURN);
     AncestorRealistic ancestorReal;
+    vector<bool> pending(active->getNumTrials(),false);
+    bool waiting = false;
     for(iter=data.beginOp(CPUI_RETURN);iter!=iterend;++iter) {
       op = *iter;
       if (op->isDead()) continue;
@@ -2054,7 +2082,20 @@ int4 ActionReturnRecovery::apply(Funcdata &data)
 	if (ancestorReal.execute(op,slot,&trial,false))
 	  if (data.ancestorOpUse(maxancestor,vn,op,trial,0,0))
 	    trial.markActive(); // This varnode sees active use as a parameter
+	if (!trial.isActive() && active->getNumPasses() == 0 && isPendingStackLoad(vn,data)) {
+	  active->setMaxPass(3);	// Wait for stack heritage to resolve the spill
+	  pending[i] = true;
+	  waiting = true;
+	}
 	count += 1;
+      }
+    }
+    // Only the spilled trials wait, the others keep their verdict from this pass
+    if (waiting) {
+      for(i=0;i<active->getNumTrials();++i) {
+	ParamTrial &trial(active->getTrial(i));
+	if (!trial.isChecked() && !pending[i])
+	  trial.markInactive();
       }
     }
 

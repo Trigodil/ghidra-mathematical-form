@@ -2049,6 +2049,9 @@ bool Funcdata::ancestorOpUse(int4 maxlevel,const Varnode *invn,
     if ((invn->getSpace()->getType()==IPTR_INTERNAL)||def->isIncidentalCopy()||def->getIn(0)->isIncidentalCopy()) {
       return ancestorOpUse(maxlevel-1,def->getIn(0),op,trial,offset,mainFlags);
     }
+    // A reload from a stack spill just restores the spilled value for a return
+    if (op->code()==CPUI_RETURN && def->getIn(0)->getSpace()->getType()==IPTR_SPACEBASE)
+      return ancestorOpUse(maxlevel-1,def->getIn(0),op,trial,offset,mainFlags);
     break;
   case CPUI_PIECE:
     // Concatenation tends to be artificial, so recurse through piece corresponding later SUBPIECE
