@@ -332,11 +332,84 @@ def lower_vectors(text):
         if name in pointers:
             text = re.sub(rf'\(\s*\*\s*{escaped}\s*\)\s*\[', f'((xunknown1 *){name})[', text)
             text = re.sub(rf'\b{escaped}\s*\[([^\[\]]*)\]\s*\[', rf'((xunknown1 *)&{name}[\1])[', text)
+            # A bare *p is the array itself, which decays to the address p.
+            text = re.sub(rf'(\*\s*\)\s*)\*\s*{escaped}\b(?!\s*[\[.])', rf'\1{name}', text)
+            text = re.sub(rf'([(,]\s*)\*\s*{escaped}\b(?=\s*[+-])', rf'\1((xunknown1 *){name})', text)
             # A bare element p[k] is an array that decays to the address of that element.
             text = re.sub(rf'(?<![\w.&]){escaped}\s*\[([^\[\]]*)\]', lambda m: element_address(text, m, name), text)
         else:
             text = re.sub(rf'(?<![\w.&]){escaped}\s*\[', f'((xunknown1 *)&{name})[', text)
     return text, sorted(words)
+
+
+def statement_end(mask, start):
+    """Index of the ; , or ) that ends the expression beginning at start, at depth zero."""
+    depth = 0
+    for position in range(start, len(mask)):
+        ch = mask[position]
+        if depth == 0 and ch in ';,)':
+            return position
+        if ch in '([{': depth += 1
+        elif ch in ')]}': depth -= 1
+    return None
+
+
+STRUCT_CAST = re.compile(r'\(\s*(\w+_stackargs)\s*\)')
+
+
+def cast_operand_end(mask, start):
+    """End of the cast-expression that begins at start: unary operators, a primary and its postfix chain."""
+    position = start
+    while position < len(mask) and mask[position] in ' \t\n*&-!~':
+        position += 1
+    if position < len(mask) and mask[position] == '(':
+        depth = 0
+        while position < len(mask):
+            depth += {'(': 1, ')': -1}.get(mask[position], 0)
+            position += 1
+            if depth == 0:
+                break
+    else:
+        match = re.compile(r'[A-Za-z_]\w*|0[xX][0-9a-fA-F]+|\d+').match(mask, position)
+        if not match:
+            return None
+        position = match.end()
+    while position < len(mask):
+        if mask[position] in '([':
+            close = ')' if mask[position] == '(' else ']'
+            depth = 0
+            while position < len(mask):
+                depth += {'(': 1, '[': 1, ')': -1, ']': -1}.get(mask[position], 0)
+                position += 1
+                if depth == 0:
+                    break
+        else:
+            match = re.compile(r'(?:\.|->)\s*[A-Za-z_]\w*').match(mask, position)
+            if not match:
+                break
+            position = match.end()
+    return position
+
+
+def lower_struct_casts(text):
+    """A value cannot be cast to a struct type in C; copy its bytes into a zeroed temporary."""
+    while True:
+        mask = code_mask(text)
+        for match in STRUCT_CAST.finditer(mask):
+            end = cast_operand_end(mask, match.end())
+            if end is None or end <= match.end():
+                continue
+            operand = text[match.end():end].strip()
+            name = match[1]
+            stars = operand.startswith('*') or re.fullmatch(r'[A-Za-z_][\w.>\[\]-]*', operand)
+            holder = f'&({operand})' if stars else f'(__typeof__({operand}) []){{ {operand} }}'
+            size = f'sizeof({operand})' if stars else f'sizeof(__typeof__({operand}))'
+            replacement = (f'({{ {name} t__ = {{0}}; __builtin_memcpy(&t__, {holder}, '
+                           f'{size} < sizeof t__ ? {size} : sizeof t__); t__; }})')
+            text = text[:match.start()] + replacement + text[end:]
+            break
+        else:
+            return text
 
 
 def lower_storage(text):
@@ -366,7 +439,8 @@ def lower_storage(text):
         text = text[:start] + replacement + text[end:]
 
     used, unresolved = set(), []
-    pattern = re.compile(r'\b([A-Za-z_]\w*)\._(\d+)_(\d+)_\b')
+    # The object is a whole postfix chain such as a.b, a->b or a[i].b.
+    pattern = re.compile(r'(?<![\w.>])([A-Za-z_]\w*(?:(?:\.|->)[A-Za-z_]\w*|\[[^\[\]]*\])*)\._(\d+)_(\d+)_\b')
     # Scalar locals a slice may overrun; those are widened below so the slice stays in storage.
     scalars = {}
     for m in re.finditer(r'^[ \t]*(?:(xunknown|uint|int|undefined)(\d+)|\w+[ \t]*\*)[ \t]*([A-Za-z_]\w*)[ \t]*;',
@@ -381,6 +455,30 @@ def lower_storage(text):
             if match.start() < cursor:
                 continue
             name, offset, width = match[1], int(match[2]), int(match[3])
+            if width > 16 and width <= 4096:
+                # Pieces wider than a word are byte ranges of the object, copied or viewed in place.
+                after = mask[match.end():].lstrip()
+                before = mask[:match.start()].rstrip()
+                if after.startswith('=') and not after.startswith('=='):
+                    if before and not re.search(r'(?:[;{}:(),]|\belse|\bdo)$', before):
+                        unresolved.append(match[0])
+                        continue
+                    start = match.end() + len(mask[match.end():]) - len(mask[match.end():].lstrip()) + 1
+                    stop = statement_end(mask, start)
+                    if stop is None:
+                        unresolved.append(match[0])
+                        continue
+                    value = lower(fragment[start:stop]).strip()
+                    source = f'&({value})' if value.startswith(('*', '(*')) else \
+                        f'(__typeof__({value}) []){{ {value} }}'
+                    replacement = f'__builtin_memcpy((char *)&{name} + {offset}, (const char *){source}, {width})'
+                    end = stop
+                else:
+                    replacement = f'(*(xunknown1 (*)[{width}])((char *)&{name} + {offset}))'
+                    end = match.end()
+                pieces.extend([fragment[cursor:match.start()], replacement])
+                cursor = end
+                continue
             if not 1 <= width <= 16:
                 unresolved.append(match[0])
                 continue
@@ -452,6 +550,64 @@ def initialize_tls_base(text):
                   r'\1 = __recovery_fs_base();', text, flags=re.M)
 
 
+def array_pointer_edits(source, mask, name, width, signed):
+    """Edits that load or store the whole odd-width element behind `*name` when it is used as a value."""
+    edits = []
+    for use in re.finditer(rf'\*\s*{re.escape(name)}\b(?!\s*[\[.(]|->)', mask):
+        before, tail = mask[:use.start()].rstrip(), mask[use.end():].lstrip()
+        if before and (before[-1].isalnum() or before[-1] in '_)]') and not re.search(r'\breturn$', before):
+            if before[-1] == ')':
+                depth, index = 0, len(before) - 1
+                while index >= 0:
+                    depth += {')': 1, '(': -1}.get(before[index], 0)
+                    if depth == 0:
+                        break
+                    index -= 1
+                head = before[:index].rstrip()
+                inner = before[index + 1:-1]
+                # Only an integer cast keeps the dereference a value.
+                if not re.fullmatch(r'[\w\s]+', inner) or re.search(r'\w$', head) and not re.search(r'\b(?:return|else|case|do)$', head):
+                    continue
+            else:
+                continue
+        elif before.endswith('&') or before.endswith(('(', ',')) and re.search(r'\w\s*\($|,$', before) and \
+                _is_call_argument(before):
+            continue
+        store = tail.startswith('=') and not tail.startswith('==')
+        if tail.startswith(('++', '--')) or re.match(r'[-+*/%&|^]=|<<=|>>=', tail):
+            continue
+        if store:
+            if before and before[-1] not in ';{}':
+                continue
+            start = use.end() + len(mask[use.end():]) - len(mask[use.end():].lstrip()) + 1
+            stop = statement_end(mask, start)
+            if stop is None:
+                continue
+            edits.append((use.start(), stop, width,
+                          f'{{ {ctype(next(w for w in WIDTHS if w >= width))} v__ = ({source[start:stop].strip()}); '
+                          f'__builtin_memcpy({name}, &v__, {width}); }}'))
+            continue
+        load = f'__recovery_load{width}((const void *){name})'
+        if signed:
+            wide = next(w for w in WIDTHS if w >= width)
+            shift = (wide - width) * 8
+            load = f'(({ctype(wide, True)})(({ctype(wide)}){load} << {shift}) >> {shift})'
+        edits.append((use.start(), use.end(), width, load))
+    return edits
+
+
+def _is_call_argument(before):
+    """True when the text ends inside call parentheses, `f(` or `f(x,`."""
+    depth = 0
+    for index in range(len(before) - 1, -1, -1):
+        depth += {')': 1, '(': -1}.get(before[index], 0)
+        if depth < 0:
+            head = before[:index].rstrip()
+            return bool(re.search(r'[\w\]]$', head)) and not re.search(
+                r'\b(?:if|while|switch|for|return)$', head)
+    return False
+
+
 def lower_odd_widths(text):
     """Lower proven-width loads, value casts and value locals, leaving other uses explicit.
 
@@ -466,6 +622,11 @@ def lower_odd_widths(text):
 
     def odd(width):
         return width not in WIDTHS and 1 <= width <= 16
+
+    # Pointers to odd-width integer arrays: their dereference is a value, not a decayed address.
+    pointers = sorted({(m[3], int(m[2]), m[1] == 'int') for m in
+                       re.finditer(r'\bunk(u?int)(\d+)\s*\*\s*([A-Za-z_]\w*)\b', code_mask(text))
+                       if odd(int(m[2])) and not re.match(r'\s*[\[(]', code_mask(text)[m.end():])})
 
     def lowered_pass(source):
         mask = code_mask(source)
@@ -516,6 +677,8 @@ def lower_odd_widths(text):
             edits.append((match.start(), end + 1, width,
                           f'__recovery_load{width}((const void *)(uintptr_t)'
                           f'({source[match.end():end]}))'))
+        for name, width, signed in pointers:
+            edits.extend(array_pointer_edits(source, mask, name, width, signed))
         for match in cast.finditer(mask):
             width = int(match[2])
             end = operand_end(match.end())
@@ -663,6 +826,15 @@ def lower_frame(text):
 
 
 def odd_width_helper(width):
+    if width == 3:
+        # A halfword and a byte, as compilers read a little-endian 24-bit field.
+        return (
+            'static inline uint32_t __recovery_load3(const void *p) {\n'
+            '    uint16_t lo;\n'
+            '    __builtin_memcpy(&lo, p, 2);\n'
+            '    return (uint32_t)lo + ((uint32_t)((const uint8_t *)p)[2] << 16);\n'
+            '}'
+        )
     return (
         f'static inline {ctype(width)} __recovery_load{width}(const void *p) {{\n'
         f'    {ctype(width)} value = 0;\n'
@@ -723,6 +895,21 @@ def lower_pointer_floats(text):
     return re.sub(r'^(\s*)([^=;{}\n]+?) = \(float8\)("(?:[^"\\\n]|\\.)*"|[A-Za-z_]\w*);$', store, text, flags=re.M)
 
 
+def stack_structs(base, binary_report, source):
+    """Definitions of the by-value stack argument structs that the emitted text names."""
+    lines = []
+    # A subset of functions still names the structs of callees outside the subset.
+    for row in binary_report.get('all_functions', binary_report.get('functions', [])):
+        try:
+            records = abi_evidence.read_evidence(base / 'functions' / f'{row["address"]:x}' / 'prototype-evidence.tsv')
+        except (OSError, ValueError):
+            continue
+        block = next((r['stackargs'] for r in records if r['kind'] == 'function' and r['stackargs']), None)
+        if block and block['name'] != '-' and re.search(rf'\b{re.escape(block["name"])}\b', source):
+            lines.append(abi_evidence.stack_struct_source(block['name'], block))
+    return '\n'.join(lines) + '\n\n' if lines else ''
+
+
 def assemble(binary_report):
     base = Path(binary_report['output'])
     bodies, missing, definitions, prototypes = [], [], {}, []
@@ -765,6 +952,7 @@ def assemble(binary_report):
     for address, text in bodies:
         lowered, vectors = lower_vectors(replace_identifiers(text, renames))
         lowered, used, detail = lower_storage(lowered)
+        lowered = lower_struct_casts(lowered)
         lowered, odd_used = lower_odd_widths(initialize_tls_base(lower_pointer_floats(lowered)))
         lowered, frame = lower_frame(lowered)
         if frame:
@@ -829,7 +1017,7 @@ def assemble(binary_report):
     global_metadata['name_declared_globals'] = missing_names
     globals_source = '\n'.join(filter(None, [globals_source, missing_source]))
     # Avoid accepting implicit int-return declarations for cross-function calls.
-    program = '#include "recovered_support.h"\n\n' + '\n'.join(prototypes) + '\n\n' + globals_source + '\n\n' + source
+    program = '#include "recovered_support.h"\n\n' + stack_structs(base, binary_report, source) + '\n'.join(prototypes) + '\n\n' + globals_source + '\n\n' + source
     metadata = dict(function_count=len(bodies), missing_functions=missing,
                     toolchain_runtime_excluded=sorted(excluded),
                     imports_called=sorted(called_imports),

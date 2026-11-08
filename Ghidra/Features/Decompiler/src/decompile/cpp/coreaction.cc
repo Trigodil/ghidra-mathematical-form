@@ -1111,6 +1111,7 @@ MapEntry *ActionConstantPtr::isPointer(AddrSpace *spc,Varnode *vn,PcodeOp *op,in
   vn->setSymbolCheck(Varnode::symcheck_complete);
   Architecture *glb = data.getArch();
   Varnode *outvn;
+  if (!glb->isMappedAddress(vn->getOffset())) return (MapEntry *)0;	// Not inside any loaded section
   if (vn->getTypeReadFacing(op)->getMetatype() == TYPE_PTR) { // Are we explicitly marked as a pointer
     rampoint = glb->resolveConstant(spc,vn->getOffset(),vn->getSize(),op->getAddr(),fullEncoding);
     needexacthit = false;

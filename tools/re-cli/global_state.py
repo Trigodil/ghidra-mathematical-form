@@ -270,6 +270,28 @@ def recover(base, rows, functions=None, source="", image=None):
         words = relocated_words(record, image)
         if words is not None:
             relocated_arrays[name] = words
+    # A relocated target no recovered object holds becomes a string object, so that it is a
+    # neighbour of the objects around it rather than a separate placement.
+    if image is not None:
+        wanted = {r["pointer_target"] for r in records.values()
+                  if r.get("pointer_target") is not None and not r["pointer_target_is_code"]
+                  and r.get("initial_status") != "known" and r["size"] == 8}
+        for words in relocated_arrays.values():
+            wanted.update(t for _, t in words if t is not None and t not in functions)
+        for target in sorted(wanted):
+            if any(start <= target < end for start, end in extents):
+                continue
+            section = image.section_at(target)
+            raw = section and image.read(target, min(4096, section["addr"] + section["size"] - target))
+            end = raw.find(b"\0") if raw else -1
+            if end < 0 or section["flags"] & 5 or not section["flags"] & 2:
+                continue
+            name = f"__recovery_string_{target:x}"
+            records.setdefault(name, dict(
+                name=name, address=target, size=end + 1, declaration=f"char {name} [{end + 1}];",
+                initial_status="known", initial_hex=raw[: end + 1].hex(), pointer_target=None,
+                pointer_target_is_code=False))
+            extents.append((target, target + end + 1))
     for name, record in records.items():
         if name in relocated_arrays:
             continue
@@ -309,9 +331,22 @@ def recover(base, rows, functions=None, source="", image=None):
             )
         else:
             accepted.append(dict(record=record, shape=shape, value=value))
+    # Views of one relocated word with the same extent and target share the first view's storage.
+    twins, by_extent = {}, {}
+    for name in sorted(relocated):
+        r = records[name]
+        key = (r["address"], r["size"], relocated[name], r["pointer_target_is_code"])
+        by_extent.setdefault(key, []).append(name)
+    for names in by_extent.values():
+        primary = min(names, key=lambda n: (not declaration_shape(records[n])["pointer"], n))
+        twins.update({n: primary for n in names if n != primary})
+    for name in twins:
+        del relocated[name]
+    accepted = [item for item in accepted if item["record"]["name"] not in twins]
     # An unresolved overlapping view cannot safely be split off from a known one.
     components = []
-    for record in sorted(records.values(), key=lambda r: (r["address"], r["size"])):
+    for record in sorted((r for r in records.values() if r["name"] not in twins),
+                         key=lambda r: (r["address"], r["size"])):
         if not components or record["address"] >= components[-1]["end"]:
             components.append(
                 dict(end=record["address"] + record["size"], names=[record["name"]])
@@ -344,7 +379,10 @@ def recover(base, rows, functions=None, source="", image=None):
     groups = []
     for item in accepted:
         r = item["record"]
-        if not groups or r["address"] >= groups[-1]["end"]:
+        # Recovered objects that touch share one placement, so their distances hold.
+        touching = (groups and r["address"] == groups[-1]["end"] and RECOVERED_OBJECT.fullmatch(r["name"])
+                    and RECOVERED_OBJECT.fullmatch(groups[-1]["items"][-1]["record"]["name"]))
+        if not groups or (r["address"] >= groups[-1]["end"] and not touching):
             groups.append(
                 dict(start=r["address"], end=r["address"] + r["size"], items=[item])
             )
@@ -415,18 +453,6 @@ def recover(base, rows, functions=None, source="", image=None):
         max_ends.append(
             max(max_ends[-1] if max_ends else 0, record["address"] + record["size"])
         )
-    strings = {}
-
-    def string_object(target):
-        """Name an object holding the string literal at a read-only address no symbol covers."""
-        if target not in strings:
-            section = image.section_at(target) if image else None
-            raw = section and image.read(target, min(4096, section["addr"] + section["size"] - target))
-            end = raw.find(b"\0") if raw else -1
-            readonly = section is not None and not section["flags"] & 5 and section["flags"] & 2
-            strings[target] = (f"__recovery_string_{target:x}", raw[: end + 1]) if end >= 0 and readonly else None
-        return strings[target][0] if strings[target] else None
-
     references = {}
     for item in pointer_items:
         record, shape = item["record"], item["shape"]
@@ -453,10 +479,14 @@ def recover(base, rows, functions=None, source="", image=None):
                     value=f'({shape["ctype"]})((unsigned char *)&{other["name"]} + {offset})',
                     dependency=other["name"],
                 )
-            elif string_object(target):
-                references[name] = dict(
-                    value=f'({shape["ctype"]}){string_object(target)}', dependency=None
-                )
+            else:
+                past = [o for o in address_objects if o["address"] + o["size"] == target]
+                if past:
+                    other = min(past, key=lambda r: (r["size"], r["name"]))
+                    references[name] = dict(
+                        value=f'({shape["ctype"]})((unsigned char *)&{other["name"]} + {other["size"]})',
+                        dependency=other["name"],
+                    )
         if name not in references:
             blocked.add(name)
             obligations.append(
@@ -489,8 +519,10 @@ def recover(base, rows, functions=None, source="", image=None):
                 values.append(f'(unsigned long)((unsigned char *)&{other["name"]} + {target - other["address"]})')
             elif functions.get(target):
                 values.append(f"(unsigned long)&{functions[target]}")
-            elif string_object(target):
-                values.append(f"(unsigned long){string_object(target)}")
+            elif any(o["address"] + o["size"] == target and o["name"] not in blocked for o in address_objects):
+                other = min((o for o in address_objects if o["address"] + o["size"] == target and o["name"] not in blocked),
+                            key=lambda r: (r["size"], r["name"]))
+                values.append(f'(unsigned long)((unsigned char *)&{other["name"]} + {other["size"]})')
             else:
                 values = None
                 obligations.append(dict(name=name, reason="relocation_target_not_recovered", target=target))
@@ -501,11 +533,6 @@ def recover(base, rows, functions=None, source="", image=None):
                 f'extern {record["declaration"].rstrip(";")} __attribute__((alias("__recovery_words_{name}")));'
             )
             exported.append(name)
-    for symbol, raw in filter(None, strings.values()):
-        declarations.append(
-            f"static const unsigned char {symbol}[{len(raw)}] = {{"
-            + ",".join(str(byte) for byte in raw) + "};"
-        )
     declarations.extend(
         "extern " + item["record"]["declaration"]
         for item in pointer_items
@@ -520,6 +547,12 @@ def recover(base, rows, functions=None, source="", image=None):
             record["declaration"].rstrip(";") + " = " + references[name]["value"] + ";"
         )
         exported.append(name)
+    for name, primary in sorted(twins.items()):
+        if primary in exported:
+            declarations.append(
+                f'extern {records[name]["declaration"].rstrip(";")} __attribute__((alias("{primary}")));'
+            )
+            exported.append(name)
     declarations.extend(array_declarations)
     # Unrecovered storage stays an explicit external symbol, never invented data.
     external = []

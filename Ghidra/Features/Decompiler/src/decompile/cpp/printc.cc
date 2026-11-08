@@ -1767,6 +1767,7 @@ bool PrintC::pushPtrCharConstant(uintb val,const TypePointer *ct,const Varnode *
 
 {
   if (val==0) return false;
+  if (!glb->isMappedAddress(val)) return false;
   AddrSpace *spc = glb->getDefaultDataSpace();
   uintb fullEncoding;
   Address point;

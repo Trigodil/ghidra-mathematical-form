@@ -444,6 +444,8 @@ def recover(
             diagnostic_limit,
             *profile["sources"],
             *profile.get("flags", []),
+            # Recovered code is type punned; TBAA would miscompile it.
+            "-fno-strict-aliasing",
             "-o",
             "rebuilt.elf",
         ]

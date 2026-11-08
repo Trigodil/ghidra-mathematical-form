@@ -18,6 +18,7 @@ class MappedElfImage : public ghidra::LoadImage {
     ghidra::AddrSpace *space=nullptr;
     struct Relocation { uint64_t address; bool known; uint64_t value; };
     std::vector<Relocation> relocations;
+    std::vector<std::pair<uint64_t,uint64_t>> sections;	// allocated section ranges
     bool unknownRelocationRead=false;
 public:
     explicit MappedElfImage(const std::string& path):LoadImage(path),data(path) {
@@ -40,6 +41,7 @@ public:
             uint64_t(h.e_shnum)*sizeof(Elf64_Shdr)<=data.size()-h.e_shoff,"Invalid ELF sections");
         for(unsigned i=0;i<h.e_shnum;++i) {
             Elf64_Shdr sh; std::memcpy(&sh,data.data()+h.e_shoff+i*sizeof(sh),sizeof(sh));
+            if((sh.sh_flags&SHF_ALLOC) && sh.sh_size) sections.push_back({sh.sh_addr,sh.sh_size});
             if(sh.sh_type!=SHT_RELA && sh.sh_type!=SHT_REL && sh.sh_type!=SHT_RELR) continue;
             size_t width=sh.sh_type==SHT_RELA ? sizeof(Elf64_Rela) : (sh.sh_type==SHT_REL ? sizeof(Elf64_Rel) : sizeof(uint64_t));
             fibers::require(sh.sh_entsize==width && sh.sh_size%width==0 && sh.sh_offset<=data.size() && sh.sh_size<=data.size()-sh.sh_offset,"Invalid relocations");
@@ -65,6 +67,12 @@ public:
         std::sort(relocations.begin(),relocations.end(),[](const auto& a,const auto& b){return a.address<b.address;});
     }
     void attach(ghidra::AddrSpace *s){space=s;}
+    // Headers and gaps between sections are not addresses; no section table means no filter.
+    bool inSection(uint64_t address) const {
+        if(sections.empty()) return true;
+        for(const auto& s:sections) if(address>=s.first && address-s.first<s.second) return true;
+        return false;
+    }
     bool hasUnknownRelocationRead() const { return unknownRelocationRead; }
     bool dataRange(uint64_t address,uint64_t size) const {
         if(size==0 || address>UINT64_MAX-size) return false;
@@ -386,6 +394,9 @@ class StaticElfArchitecture : public ghidra::SleighArchitecture {
             scope->addSymbol(name.str(),type,where,ghidra::Address());
         }
     }
+    bool isMappedAddress(ghidra::uintb value) const override {
+        return static_cast<MappedElfImage*>(loader)->inSection(value);
+    }
     bool isAddressConstant(ghidra::uintb value) const override {
         return provenance->isTarget(value);
     }
@@ -438,15 +449,94 @@ static std::string joinPieces(const ghidra::Address &address) {
     return text.str();
 }
 
+// Stack words read above the return address form one by-value struct argument.
+struct StackArg { uint64_t offset; int size; std::string type; };
+
+// A field keeps pointer-ness: function pointers are p8_c0_0, other opaque pointers void *.
+static std::string stackFieldType(const ghidra::Datatype *type) {
+    std::string text = describePrototypeType(type);
+    if (text != "unsupported") return text;
+    if (type->getMetatype() == ghidra::TYPE_PTR && type->getSize() == 8) {
+        const auto *to = static_cast<const ghidra::TypePointer *>(type)->getPtrTo();
+        return to->getMetatype() == ghidra::TYPE_CODE ? "p8_c0_0" : "p8_b17_0";
+    }
+    return "b15_" + std::to_string(type->getSize());
+}
+
+static bool isStackArgs(const ghidra::Datatype *type) {
+    const std::string &name = type->getName();
+    return type->getMetatype() == ghidra::TYPE_STRUCT && name.size() > 10 &&
+           name.compare(name.size() - 10, 10, "_stackargs") == 0;
+}
+
+// Stack offset 8 is the first word above the return address.
+static std::vector<StackArg> discoverStackArgs(ghidra::Funcdata &fd) {
+    std::vector<StackArg> found;
+    // A cold fragment runs in its parent's frame, so its stack words are not arguments.
+    const std::string &name = fd.getName();
+    if (name.find("cold") != std::string::npos) return found;
+    // Words the decompiler already made parameters are not left over.
+    const auto &proto = fd.getFuncProto();
+    for (int i = 0; i < proto.numParams(); ++i) {
+        auto address = proto.getParam(i)->getAddress();
+        if (!address.isInvalid() && address.getSpace()->getType() == ghidra::IPTR_SPACEBASE) return found;
+    }
+    for (auto it = fd.beginDef(ghidra::Varnode::input); it != fd.endDef(ghidra::Varnode::input); ++it) {
+        auto *vn = *it;
+        if (vn->getSpace()->getType() != ghidra::IPTR_SPACEBASE || vn->getOffset() < 8 ||
+            vn->getOffset() >= 8 + 512) continue;
+        if (vn->getSize() < 1 || vn->getSize() > 16) return {};
+        std::string type = stackFieldType(vn->getType());
+        found.push_back({vn->getOffset(), vn->getSize(), type});
+    }
+    std::sort(found.begin(), found.end(), [](const StackArg &a, const StackArg &b) {
+        return a.offset != b.offset ? a.offset < b.offset : a.size > b.size; });
+    std::vector<StackArg> fields;
+    for (const auto &arg : found) {
+        if (!fields.empty() && arg.offset < fields.back().offset + fields.back().size) {
+            if (arg.offset + arg.size > fields.back().offset + fields.back().size) return {};
+            continue;	// contained in a wider word
+        }
+        fields.push_back(arg);
+    }
+    // Callers store whole words, so a narrow field owns the rest of its slot when free.
+    for (size_t i = 0; i < fields.size(); ++i) {
+        auto &field = fields[i];
+        if (field.size >= 8 || field.offset % 8 != 0) continue;
+        if (i + 1 == fields.size() || fields[i + 1].offset >= field.offset + 8) {
+            field.size = 8;
+            field.type = "b15_8";
+        }
+    }
+    return fields;
+}
+
+static std::vector<StackArg> structStackArgs(const ghidra::Datatype *type) {
+    std::vector<StackArg> fields;
+    const auto *record = dynamic_cast<const ghidra::TypeStruct *>(type);
+    if (record == nullptr) return fields;
+    for (auto it = record->beginField(); it != record->endField(); ++it) {
+        std::string text = stackFieldType(it->type);
+        fields.push_back({uint64_t(it->offset) + 8, it->type->getSize(), text});
+    }
+    return fields;
+}
+
 // Record the decompiler's inferred machine storage without claiming that it is
 // an authoritative source signature. Each decompilation has its own context.
 static void exportPrototype(std::ostream &out, const std::string &kind,
                             uint64_t site, uint64_t target,
-                            const ghidra::FuncProto &proto) {
+                            const ghidra::FuncProto &proto,
+                            const std::vector<StackArg> *discovered = nullptr,
+                            const ghidra::PcodeOp *callOp = nullptr) {
+    // The stack struct is reported apart from the register parameters.
+    int stackIndex = -1;
+    for (int i = 0; i < proto.numParams(); ++i)
+        if (proto.getParam(i)->getType() && isStackArgs(proto.getParam(i)->getType())) stackIndex = i;
     out << kind << '\t' << std::hex << site << '\t' << target << std::dec
         << '\t' << (proto.hasModel() ? proto.getModelName() : "unknown")
         << '\t' << proto.isDotdotdot() << '\t' << proto.hasCustomStorage()
-        << '\t' << proto.numParams() << "\n";
+        << '\t' << proto.numParams() - (stackIndex >= 0) << "\n";
     auto writeParameter = [&](const char *role, int index, ghidra::ProtoParameter *param) {
         if (param == nullptr || param->getType() == nullptr) return;
         auto address = param->getAddress();
@@ -461,9 +551,36 @@ static void exportPrototype(std::ostream &out, const std::string &kind,
             out << '\t' << joinPieces(address);
         out << "\n";
     };
-    writeParameter("output", -1, proto.getOutput());
+    auto *result = callOp ? callOp->getOut() : nullptr;
+    if (result != nullptr && result->getSpace()->getType() == ghidra::IPTR_PROCESSOR &&
+        (proto.getOutput() == nullptr || proto.getOutput()->getAddress().isInvalid())) {
+        // An unlocked callee: report the width the caller actually reads.
+        out << "parameter\toutput\t-1\t" << result->getSpace()->getName() << '\t' << std::hex
+            << result->getOffset() << std::dec << '\t' << result->getSize() << '\t'
+            << static_cast<int>(result->getType()->getMetatype()) << "\t0\t"
+            << describePrototypeType(result->getType()) << "\n";
+    }
+    else writeParameter("output", -1, proto.getOutput());
     for (int i = 0; i < proto.numParams(); ++i)
-        writeParameter("input", i, proto.getParam(i));
+        if (i != stackIndex) writeParameter("input", i, proto.getParam(i));
+    std::vector<StackArg> fields;
+    std::string name = "-";
+    int total = 0;
+    if (stackIndex >= 0) {
+        auto *type = proto.getParam(stackIndex)->getType();
+        fields = structStackArgs(type);
+        name = type->getName();
+        total = type->getSize();
+    } else if (discovered != nullptr && !discovered->empty()) {
+        fields = *discovered;
+        total = int((fields.back().offset + fields.back().size - 8 + 7) & ~uint64_t(7));
+        if (total < 24) total = 24;	// over 16 bytes the struct is passed in memory
+    }
+    if (fields.empty()) return;
+    out << "stackargs\t" << name << '\t' << std::hex << total << std::dec << "\n";
+    for (const auto &field : fields)
+        out << "stackarg\t" << std::hex << field.offset << '\t' << std::dec << field.size
+            << '\t' << field.type << "\n";
 }
 
 struct SeedStorage {
@@ -480,6 +597,11 @@ static ghidra::Datatype *parseSeedType(ghidra::Architecture &arch,
     if (depth > 8 || pos >= text.size()) throw std::runtime_error("type depth");
     char kind = text[pos++];
     size_t start = pos;
+    if (kind == 'c') {	// c0_0: code
+        if (text.compare(pos, 3, "0_0") != 0) throw std::runtime_error("invalid type descriptor");
+        pos += 3;
+        return arch.types->getTypeCode();
+    }
     while (pos < text.size() && std::isdigit(static_cast<unsigned char>(text[pos]))) ++pos;
     if (pos == start || pos >= text.size() || text[pos++] != '_')
         throw std::runtime_error("invalid type descriptor");
@@ -558,14 +680,15 @@ static void applyPrototypeSeeds(StaticElfArchitecture &arch, ghidra::Scope *scop
             if (consumed != fields[0].size()) throw std::runtime_error("invalid target");
             auto *image = static_cast<MappedElfImage *>(arch.loader);
             if (!image->executableAddress(target)) throw std::runtime_error("non-executable target");
-            if (target == selected) throw std::runtime_error("self seed");
             if (imports.count(target)) throw std::runtime_error("import prototype is fixed");
             auto *model = arch.getModel(fields[1]);
             if (model == nullptr || model->isUnknown()) throw std::runtime_error("unknown model");
             std::vector<SeedStorage> expected;
             bool noReturn = false;
+            std::string stackSeed;
             for (size_t i = 2; i < fields.size(); ++i) {
                 if (fields[i] == "noreturn") noReturn = true;
+                else if (fields[i].compare(0, 6, "stack=") == 0) stackSeed = fields[i].substr(6);
                 else expected.push_back(parseSeedStorage(arch, fields[i]));
             }
             if (expected.empty()) throw std::runtime_error("invalid row");
@@ -577,8 +700,47 @@ static void applyPrototypeSeeds(StaticElfArchitecture &arch, ghidra::Scope *scop
                 pieces.intypes.push_back(expected[i].type);
                 pieces.innames.push_back("");
             }
+            int stackSize = 0;
+            if (!stackSeed.empty()) {
+                // stack=NAME;SIZE;OFFSET.SIZE.TYPE;...  with offsets from 8
+                std::vector<std::string> parts;
+                std::istringstream text(stackSeed);
+                std::string part;
+                while (std::getline(text, part, ';')) parts.push_back(part);
+                if (parts.size() < 3 || parts[0].size() < 11) throw std::runtime_error("invalid stack seed");
+                stackSize = std::stoi(parts[1], nullptr, 16);
+                if (stackSize <= 16 || stackSize > 4096 || stackSize % 8) throw std::runtime_error("invalid stack size");
+                std::vector<ghidra::TypeField> members;
+                uint64_t end = 0;
+                for (size_t i = 2; i < parts.size(); ++i) {
+                    auto dot = parts[i].find('.');
+                    auto dot2 = parts[i].find('.', dot + 1);
+                    if (dot == std::string::npos || dot2 == std::string::npos) throw std::runtime_error("invalid stack field");
+                    uint64_t offset = std::stoull(parts[i].substr(0, dot), nullptr, 16);
+                    int size = std::stoi(parts[i].substr(dot + 1, dot2 - dot - 1));
+                    size_t pos = 0;
+                    std::string descriptor = parts[i].substr(dot2 + 1);
+                    auto *type = parseSeedType(arch, descriptor, pos);
+                    if (pos != descriptor.size() || type->getSize() != size || offset < 8 ||
+                        offset - 8 < end || offset - 8 + size > uint64_t(stackSize))
+                        throw std::runtime_error("invalid stack field");
+                    end = offset - 8 + size;
+                    members.emplace_back(int(i), int(offset - 8), "f_" + parts[i].substr(0, dot), type);
+                }
+                auto *record = arch.types->getTypeStruct(parts[0]);
+                arch.types->setStructFields(members, record, stackSize, 8);
+                pieces.intypes.push_back(record);
+                pieces.innames.push_back("");
+            }
             std::vector<ghidra::ParameterPieces> assigned;
             model->assignParameterStorage(pieces, assigned, false);
+            if (stackSize) {
+                if (assigned.size() != expected.size() + 1) throw std::runtime_error("implicit parameters");
+                const auto last = assigned.back().addr;
+                if (last.isInvalid() || last.getSpace()->getName() != "stack" || last.getOffset() != 8)
+                    throw std::runtime_error("ABI storage mismatch");
+                assigned.pop_back();
+            }
             if (assigned.size() != expected.size()) throw std::runtime_error("implicit parameters");
             for (size_t i = 0; i < assigned.size(); ++i) {
                 const auto address = assigned[i].addr;
@@ -781,8 +943,9 @@ int main(int argc,char **argv) {
         // Export only addresses the decompiler actually resolved; the frontend
         // decides whether the image's relocation state permits using them.
         std::ofstream prototypes(std::filesystem::path(argv[4]) / "prototype-evidence.tsv");
+        const auto stackArgs = discoverStackArgs(*fd);
         exportPrototype(prototypes, "function", selectedAddress, selectedAddress,
-                        fd->getFuncProto());
+                        fd->getFuncProto(), &stackArgs);
         for (int i = 0; i < fd->numCalls(); ++i) {
             auto call = fd->getCallSpecs(i);
             auto op = call->getOp();
@@ -792,7 +955,7 @@ int main(int argc,char **argv) {
                 target.getSpace() == arch.getDefaultCodeSpace();
             exportPrototype(prototypes, resolved ? "call" : "indirect",
                             op->getAddr().getOffset(),
-                            resolved ? target.getOffset() : 0, *call);
+                            resolved ? target.getOffset() : 0, *call, nullptr, op);
         }
         prototypes.flush();
         fibers::require(bool(prototypes), "Cannot save prototype evidence");

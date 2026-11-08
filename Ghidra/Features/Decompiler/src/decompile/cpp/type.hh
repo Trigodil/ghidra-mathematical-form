@@ -893,6 +893,8 @@ public:
   TypePointer *getTypePointer(int4 s,Datatype *pt,uint4 ws,const string &n);	///< Construct a named pointer data-type
   TypeArray *getTypeArray(int4 as,Datatype *ao);		///< Construct an array data-type
   TypeStruct *getTypeStruct(const string &n);			///< Create an (empty) structure
+  void setStructFields(const vector<TypeField> &fd,TypeStruct *ot,int4 newSize,int4 newAlign)	///< Fill in a structure from outside
+  { setFields(fd,vector<TypeBitField>(),ot,newSize,newAlign,0); }
   TypePartialStruct *getTypePartialStruct(Datatype *contain,int4 off,int4 sz);	///< Create a partial structure
   TypeUnion *getTypeUnion(const string &n);			///< Create an (empty) union
   TypePartialUnion *getTypePartialUnion(TypeUnion *contain,int4 off,int4 sz);	///< Create a partial union

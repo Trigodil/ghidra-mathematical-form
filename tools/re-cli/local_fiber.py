@@ -224,7 +224,7 @@ def pseudocode_candidate(binary_report, names, directory):
     declaration, so their addresses stay masked relocations. Compile with gnu17.
     """
     rows = [row for row in binary_report.get("functions", []) if row["name"] in set(names)]
-    spec, metadata = source_project.assemble(dict(binary_report, functions=rows))
+    spec, metadata = source_project.assemble(dict(binary_report, functions=rows, all_functions=binary_report.get("functions", [])))
     if spec is None:
         raise ValueError("No decompiled pseudocode found for the requested functions")
     program = spec["files"]["program.c"]

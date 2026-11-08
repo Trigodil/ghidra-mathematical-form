@@ -230,6 +230,7 @@ public:
   int4 getMinimumLanedRegisterSize(void) const;		///< Get the minimum size of a laned register in bytes
   void setDefaultModel(ProtoModel *model);		///< Set the default PrototypeModel
   virtual bool isAddressConstant(uintb value) const { return false; }	///< Was this constant computed as an address
+  virtual bool isMappedAddress(uintb value) const { return true; }	///< Does this constant lie in a loaded section
   virtual void flowTraced(Funcdata &fd) {}		///< Observe the raw instruction flow of a function once traced
   void clearAnalysis(Funcdata *fd);			///< Clear analysis specific to a function
   void readLoaderSymbols(void);		 		///< Read any symbols from loader into database
