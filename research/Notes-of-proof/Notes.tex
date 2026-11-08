@@ -493,6 +493,78 @@ All experiments were run with gcc 15.2 at -O3. They are small, exhaustive tests,
 \paragraph{Recovery.} Taking each of the $421$ sources in turn as the hidden truth, the most probable element under the limit measure always compiles to the target bytes. It matches the hidden source in $6.4$ percent of cases when only the function bytes are observed, and in $9.5$ percent when the translation unit is observed. It preserves the same live edits in $91.4$ and $92.9$ percent of cases. The mean remaining entropy is $6.33$ and $5.22$ bits, respectively. An annealed Metropolis chain, run $1200$ times from random starting points for $4000$ steps each, ends at a source with the target bytes in $99.5$ percent of runs.
 
 These figures describe a toy space for one function and cannot, on their own, predict recovery from a real binary, where finding any candidate in the first place is the hard part.
+\section{Information inside a function}
+
+Section 9's theorem factors the fiber across functions through the summaries $(a, D)$. Here we ask the same question within a single function: does one source edit alter only a small, local portion of the bytes, or does its effect spread throughout? The answer determines whether a function can be recovered piece by piece or needs to be read as a whole.
+
+\subsection{Rewrite groups}
+
+Let $G$ be a group of behaviour-preserving rewrites of the binary, such as renaming registers while preserving the calling convention, or reordering independent instructions within a basic block. Byte equality is thus replaced by equality of $G$ orbits. This gives us a ladder of targets: exact bytes, then the orbit of $G$, then agreement on tests, and finally equal behaviour. In general, only the first two are decidable; Rice's theorem rules out deciding the last, which is why byte equality remains our target.
+
+\paragraph{Ladder test.} We took the 87 functions of run r13 that compile, are not exact and have byte similarity at least $0.8$. None of the 87 reaches any rung: not after removing nops, not under renaming that keeps the ABI, not under renaming together with reordering inside blocks, and not under unconstrained renaming. In 79 of them the instruction count differs, and in 65 it differs by exactly one instruction. The causes are type errors in the recovered source (a bool where the target returns an unsigned value, 32 against 64 bit operations, a pointer truncated in a test, a parameter typed as a pointer to a 16 byte value), not a different arrangement of the same instructions. So the near misses lie outside every orbit of $G$, and enlarging $G$ would not help.
+
+\subsection{Blobs and atoms}
+
+\begin{definition}
+For an edit $e$ of the source, its \emph{blob} $B(e)$ is the set of byte positions of the function that change when $e$ is applied. For a family of edits $E$, two positions are in the same \emph{atom} when they belong to exactly the same blobs $B(e)$, $e \in E$.
+\end{definition}
+
+Once the family is large, the connected components of the union of the blobs merge into one component per function, making them uninformative. Atoms are the useful object: they are the coarsest partition of the bytes respected by every edit.
+
+\paragraph{Small exact functions.} Among the 111 byte exact functions of r13, with 2797 compiled edits, $72.6$ percent of edits leave the bytes unchanged, and the atoms average $4.5$ bytes.
+
+\paragraph{Real source.} Across five translation units of zstd (41 emitted functions, 1251 edits of real source, gcc 15.2 at -O3), $89$ percent of edits leave the bytes unchanged, and a type change affects other functions in 38 of 109 cases. For edits that do change the bytes, the median changed share and the number of separate pieces per edit are: in bytes, $15$ percent in 27 runs; in bytes with internal jump targets masked, $12$ percent in 17 runs; in instructions, $21$ percent in 7 runs; in instructions with registers abstracted, $13$ percent in 8 runs; and in the dataflow graph with two rounds of Weisfeiler and Leman labels, $24$ percent in 5 components. Depending on the coordinate, only between $12$ and $26$ percent of edit pairs have disjoint blobs. Only $7$ percent of byte atoms lie on instruction boundaries, so the earlier impression that an atom corresponds to one instruction was just a coincidence of sizes.
+
+\paragraph{Sequential test.} In 26 functions, we fixed a prefix of source lines and varied the rest (337 line variants). Fixing the prefix eliminated 4 exact variants and added none. Among 365 pairs, we found no pair of non exact lines that became exact when combined. Thus, the fiber of a function is close to a product over its lines, even though the bytes affected by a single line are spread throughout the function.
+
+\begin{remark}
+Across functions, the fiber factors through summaries, as in Section 9. Within a function, a single edit's effect is spread across every coordinate we tested, much like a code word, while the set of correct sources remains nearly a product over lines. Recovery should therefore consider the whole function when proposing candidates, then check each line separately when accepting them.
+\end{remark}
+
+\section{Flags}
+
+As Section 10 shows, destroyed information cannot be recovered; what we can recover is the fiber $C^{-1}(b)$. The register machine preserves the program's dataflow, but not its meaning: a 64-bit value in a register could be a pointer, a size, a count or a truth value. A \emph{flag} is a label that restores some of this meaning. Flags serve two purposes: they determine the source's form before any search begins, and they are checked for consistency across the call graph.
+
+\subsection{A hierarchy of levels}
+
+Recovery advances through levels, each fixed before the next and accepted only when the result still compiles to the target bytes.
+\begin{enumerate}
+  \item Bytes: instructions and relocations, read directly from the binary.
+  \item Dataflow: values, calls and control flow, including clobbered registers, noreturn and tail calls.
+  \item Meaning: the type of each value, with flags for return kind, width, signedness, bool, pointer, array extent and structure field.
+  \item Effects: function summaries, namely purity, memory effects, constant parameters and clones. These are the summaries $a$ of Section 9.
+  \item Structure: loops, branches and inlined callees, with flags for loop form, inlined call sites, unrolling and vectorisation.
+  \item Names: idioms such as an allocation wrapper, an error code, a size or a context pointer.
+  \item Prose: formatting and comments.
+\end{enumerate}
+Levels 6 and 7 do not affect the bytes, so choices at those levels are free. The challenging levels are 3 to 5.
+
+\subsection{Flags as summary variables}
+
+Each flag is a variable on the call graph. Evidence from within the function and from call sites gives its value a likelihood, and belief propagation over the call graph yields a posterior. A flag with a confident posterior is fixed; an uncertain one becomes a search variable, which local search such as WalkSAT repairs if no candidate compiles exactly with its current value. Exact compilation and comparison remain the final test.
+
+In a toy model of flag propagation, greedy retraction performed poorly, WalkSAT and Gibbs sampling tied, belief propagation was the most cautious, and combining the latter two brought no improvement. All solvers finished within about $2$ percent of one another, indicating that the constraint is the available information, not the solver.
+
+\paragraph{Return kinds on zstd.} Suppose a function's return kind is one of void, integer, long or pointer. Among 609 zstd functions with source truth, the decompiler selects the correct kind for $83.7$ percent. Incorporating call-site evidence (how callers use the returned register) raises accuracy to $87.7$ percent: 32 functions are corrected and 8 are made incorrect. Belief propagation over forwarded returns yields no further improvement. The likelihood tables are set by hand and have not yet been fitted on held-out data.
+
+\subsection{Return width as a join}
+
+Let $W = \{1, 2, 4, 8\}$ be the lattice of register widths in bytes, ordered by size, with join $\max$. For a function $f$ let $\mathrm{def}(f) \in W$ be the width of the return register that $f$ defines on every return path, counting an earlier zeroing of the wide register, and let $\mathrm{read}(c) \in W$ be the width of the return register that a caller reads after call site $c$.
+
+\begin{proposition}
+Let $w$ assign a width to every function subject to $w(f) \ge \mathrm{def}(f)$, $w(f) \ge \mathrm{read}(c)$ for every call site $c$ of $f$, and $w(g) \ge w(f)$ whenever $g$ returns the result of $f$ unchanged. There is a least such assignment, obtained by starting from $w(f) = \max(\mathrm{def}(f), \max_c \mathrm{read}(c))$ and iterating the forwarding constraints.
+\end{proposition}
+
+\begin{proof}
+Each constraint has the form $w(g) \ge \phi(w)$ with $\phi$ monotone, and $W$ is a finite lattice. The map raising every $w(g)$ to the join of its lower bounds is monotone on the finite product lattice $W^{F}$, so iteration from the starting point reaches its least fixed point by the Kleene theorem, after at most $3|F|$ steps.
+\end{proof}
+
+When the recovered prototype is narrower than this least width, callers read bits that the recovered callee never sets. In C, these show up as uninitialised variables, causing the program to take branches at random. Run r18 had 196 such sites; the largest group arose from the error test \texttt{ZSTD\_isError}. The original implements this by clearing the whole register and then setting its lowest byte, but it had been recovered as returning bool. Seeding every prototype with its least width eliminated all 196 sites. The byte exact count increased from 145 to 156 functions in run r19, and all 11 newly exact functions had a widened return; no exact functions were lost. After a follow-up repair, the count reached 157 of 1139 in run r20.
+
+\begin{remark}
+Flags cannot restore the destroyed information $H(s \mid b)$; by data processing, nothing computed from $b$ can. Instead, they correct errors in the parts of the source that the bytes do determine and, together with a readability prior, select which point of the fiber is printed.
+\end{remark}
+
 \section{Limitations}
 
 All results in these notes are proved with respect to the machine model $\Sigma$ and a supplied, rather than inferred, ABI. Accordingly, box containment, the fibers of Section 3 and the loop invariants of Section 7 make no claims about faults, page permissions, concurrency or timing. They hold only if the binary actually uses the stated calling convention.
