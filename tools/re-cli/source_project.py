@@ -9,6 +9,7 @@ import re
 from elf_image import Elf
 import global_state
 import abi_evidence
+import machine_types
 
 NONCODE = re.compile(r'/\*[\s\S]*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 WORD = re.compile(r'\b[A-Za-z_][A-Za-z_0-9]*\b')
@@ -939,6 +940,10 @@ def assemble(binary_report):
         bodies.append((row['address'], text))
     if not bodies:
         return None, dict(missing_functions=missing, function_count=0)
+    machine = None
+    if machine_types.enabled():
+        bodies, machine = machine_types.apply_all(bodies, signature)
+        prototypes = [parsed[1] + ';' for parsed in map(signature, (t for _, t in bodies)) if parsed]
     # Address placeholders refer to the actual emitted definition, even when
     # its name comes from a native symbol rather than an invented function name.
     renames = {}
@@ -1033,6 +1038,8 @@ def assemble(binary_report):
                     global_state=global_metadata,
                     abi_evidence=abi_evidence.compare(base, binary_report.get('functions', [])),
                     semantic_equivalence_proved=False)
+    if machine is not None:
+        metadata['machine_types'] = {f'{a:x}': n for a, n in machine.items() if n}
     spec = dict(origin='whole-program decompiler proposal with integer operation lowering',
                 files={'program.c': program, 'recovered_support.h': header}, holes={},
                 profiles=[dict(compiler='gcc', flags=['-O2'], sources=['program.c'])])
