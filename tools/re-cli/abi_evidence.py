@@ -2,6 +2,9 @@
 
 These records are observations, not proof of the original source signature.
 """
+import collections
+import json
+import os
 import re
 from pathlib import Path
 
@@ -143,6 +146,121 @@ def seed_type(parameter):
     return f"b15_{parameter['size']}" if descriptor == 'unsupported' else descriptor
 
 
+INT_REGISTERS = (0x38, 0x30, 0x10, 0x8, 0x80, 0x88)	# rdi rsi rdx rcx r8 r9
+
+
+def read_flag_override(environ):
+    """Oracle flags from RE_FLAG_OVERRIDE (name then parameter tokens) and
+    RE_FLAG_OVERRIDE_RET (name then V, I, L, P or X); None when unset."""
+    params_path, returns_path = environ.get('RE_FLAG_OVERRIDE'), environ.get('RE_FLAG_OVERRIDE_RET')
+    if not params_path and not returns_path:
+        return None
+    table = {}
+    for path, slot in ((params_path, 1), (returns_path, 0)):
+        for line in Path(path).read_text().splitlines() if path else ():
+            name, *tokens = line.split()
+            entry = table.setdefault(name, [None, None])
+            entry[slot] = tokens[0] if slot == 0 else [t for t in tokens if t != '-']
+    return table
+
+
+def flag_parameter(token, offset):
+    kind, width = token[0], int(token[1:])
+    if kind == 'P':
+        return dict(space='register', offset=offset, size=8, metatype=9,
+                    type_descriptor='p8_b17_0', pieces='', locked=False)
+    meta = 14 if kind == 'S' else 13
+    return dict(space='register', offset=offset, size=width, metatype=meta,
+                type_descriptor=f'b{meta}_{width}', pieces='', locked=False)
+
+
+RETURN_FLAGS = {'V': ('invalid', 0, 17, 'b17_0'), 'I': ('register', 4, 14, 'b14_4'),
+                'L': ('register', 8, 13, 'b13_8'), 'P': ('register', 8, 9, 'p8_b17_0')}
+
+
+def override_definition(definition, entry, stats):
+    """Replace integer register parameters and the result with oracle flags.
+    Floats, stack words and unknown slots keep the decompiler's storage."""
+    ret, tokens = entry
+    changed = dict(definition)
+    if ret in RETURN_FLAGS:
+        space, size, meta, descriptor = RETURN_FLAGS[ret]
+        out = definition['output']
+        if not (out and out['type_descriptor'].startswith('p') and ret == 'P'):
+            changed['output'] = dict(space=space, offset=0, size=size, metatype=meta,
+                                     type_descriptor=descriptor, pieces='', locked=False)
+        changed['flag_return'] = True
+        stats['return_overridden'] += 1
+    elif ret is not None:
+        stats['return_kept_' + ret] += 1
+    if tokens is None:
+        return changed
+    if ret == 'X':
+        stats['params_skipped_aggregate_return'] += 1	# a hidden result pointer may take rdi
+        return changed
+    # SysV order: scalars take the next integer register, large structs go to memory,
+    # a small struct by value makes every later register position uncertain.
+    slots, complete = [], True
+    for token in tokens:
+        kind, width = token[0], int(token[1:])
+        if kind in 'PSU' and width in (1, 2, 4, 8):
+            if len(slots) < 6:
+                slots.append(token)
+        elif kind == 'O' and width <= 16 or kind in 'PSU':
+            complete = False
+            break
+    inputs = definition['inputs']
+    integer = [p['space'] == 'register' and p['offset'] in INT_REGISTERS and not p['pieces']
+               for p in inputs]
+    if any(p['space'] == 'join' for p in inputs):
+        stats['params_skipped_join_storage'] += 1
+        return changed
+    if complete and len(slots) < 6 and any(p['space'] == 'stack' for p in inputs):
+        stats['params_skipped_stack_inputs'] += 1	# fewer registers would move these words
+        return changed
+    found = sum(integer)
+    if not complete:
+        slots = slots[:found]
+        stats['params_partial_small_struct'] += 1
+    elif len(slots) > found:
+        stats['params_added_slots'] += 1
+    elif len(slots) < found:
+        stats['params_dropped_slots'] += 1
+    new, pending = [], list(slots)
+
+    def take(old):
+        token = pending.pop(0)
+        offset = INT_REGISTERS[len(slots) - len(pending) - 1]
+        # Truth says only pointer; a pointer the decompiler typed keeps its pointee.
+        if token[0] == 'P' and old and old['type_descriptor'].startswith('p8_') and old['size'] == 8:
+            return dict(old, offset=offset)
+        return flag_parameter(token, offset)
+
+    for parameter, is_integer in zip(inputs, integer):
+        if is_integer:
+            if pending:
+                new.append(take(parameter))
+            elif not complete:
+                new.append(dict(parameter))
+        else:
+            while parameter['space'] == 'stack' and pending:
+                new.append(take(None))
+            new.append(dict(parameter))
+    while pending:
+        new.append(take(None))
+    for index, parameter in enumerate(new):
+        parameter['index'] = index
+    changed['inputs'] = new
+    changed['arity'] = len(new)
+    stats['params_overridden'] += 1
+    before = [p for p, i in zip(inputs, integer) if i]
+    after = [p for p in new if p['space'] == 'register' and p['offset'] in INT_REGISTERS]
+    stats['slots_changed'] += abs(len(before) - len(after)) + sum(
+        (old['type_descriptor'], old['size']) != (now['type_descriptor'], now['size'])
+        for old, now in zip(before, after))
+    return changed
+
+
 def proven_noreturn(base, address):
     """True when the callee's own finished flow had no return, per its quality flags."""
     try:
@@ -186,6 +304,27 @@ def seed_manifests(base, rows, imports=()):
                 if r['kind'] == 'call' and out and out['space'] == 'register' and out['offset'] == 0:
                     reads[r['target']] = max(reads.get(r['target'], 0), out['size'])
 
+    overridden = set()
+    table = read_flag_override(os.environ)
+    if table is not None:
+        stats = collections.Counter()
+        for address, definition in definitions.items():
+            name = names[address]
+            if '.' in name:
+                # Clones and split fragments do not keep the source signature.
+                stats['skipped_clone_' + name.split('.', 1)[1].split('.')[0]] += 1
+            elif name not in table:
+                stats['skipped_no_truth'] += 1
+            elif definition['variadic'] or definition['custom_storage']:
+                stats['skipped_model'] += 1
+            else:
+                definitions[address] = override_definition(definition, table[name], stats)
+                overridden.add(address)
+        stats['functions_overridden'] = len(overridden)
+        # One line per refinement round; the first is against the unseeded analysis.
+        with open(Path(base) / 'flag-override.jsonl', 'a') as log:
+            log.write(json.dumps(dict(sorted(stats.items()))) + '\n')
+
     result = {}
     for caller, targets in by_caller.items():
         lines = []
@@ -194,7 +333,8 @@ def seed_manifests(base, rows, imports=()):
         own = definitions.get(caller)
         # A function reading its own stack words is reanalyzed with them as a struct parameter.
         # A narrow result that callers read wider is reanalyzed with the wider width.
-        own_row = own and (own['stackargs'] or result_width(own, reads.get(caller)))
+        own_row = own and (own['stackargs'] or result_width(own, reads.get(caller))
+                           or caller in overridden)
         wanted = sorted((set(targets) - {caller}) | ({caller} if own_row else set()))
         for target in wanted:
             if target in imports:
@@ -222,7 +362,7 @@ def seed_manifests(base, rows, imports=()):
             # Aggregates and pointers to them keep their storage as an unknown word of the same size.
             fields.extend(f"{seed_type(p)}@{p['space']}:{p['offset']:x}:{p['size']}"
                           + (f"/{p['pieces']}" if p['pieces'] else '') for p in parameters)
-            width = result_width(definition, reads.get(target))
+            width = 0 if definition.get('flag_return') else result_width(definition, reads.get(target))
             if width:
                 fields[2] = f'b13_{width}@register:0:{width}'
             block = definition['stackargs']
