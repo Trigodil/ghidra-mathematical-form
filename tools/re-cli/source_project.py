@@ -335,6 +335,8 @@ def lower_vectors(text):
             # A bare *p is the array itself, which decays to the address p.
             text = re.sub(rf'(\*\s*\)\s*)\*\s*{escaped}\b(?!\s*[\[.])', rf'\1{name}', text)
             text = re.sub(rf'([(,]\s*)\*\s*{escaped}\b(?=\s*[+-])', rf'\1((xunknown1 *){name})', text)
+            # An integer cast of *p is pointer arithmetic on the decayed address.
+            text = re.sub(rf'(\(\s*u?int\d*\s*\)\s*)\*\s*{escaped}\b(?!\s*[\[.])', rf'\1((xunknown1 *){name})', text)
             # A bare element p[k] is an array that decays to the address of that element.
             text = re.sub(rf'(?<![\w.&]){escaped}\s*\[([^\[\]]*)\]', lambda m: element_address(text, m, name), text)
         else:
