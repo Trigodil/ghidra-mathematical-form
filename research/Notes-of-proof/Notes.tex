@@ -26,6 +26,10 @@
 \begin{document}
 \maketitle
 
+\section{Comments by the author}
+
+This problem has interested me for a long time, I created this document for my notes and formal proofs on different methods of navigating structure of the "space" of the compiler algorithm and the subject, now note that this is not a normal "paper" in the sense, it is not meant to be --- these are raw ideas that came to me while solving this problem. Moving forward expect little to no filler nor explanation of the concepts.
+
 \section{The machine model}
 
 Choose a word size $w$ and let $\Z_m = \Z/m\Z$. A register file is a finite set $\mathcal{R}$ of byte cells, while memory is a total function mapping addresses to bytes. The state space is
@@ -81,7 +85,7 @@ Independence of $r$ means $f_P(\sigma) = f_P(\sigma')$ whenever $\sigma$ and $\s
 
 Only once this check succeeds is $r$ removed from the input interface.
 
-\section{Execution fibers}
+\section{Execution fibers}\label{sec:exec}
 
 \begin{definition}
 Given $f$ from $X$ into $Y$ and $y \in Y$, the \emph{fiber} over $y$ is $f^{-1}(y) = \{x \in X : f(x) = y\}$.
@@ -235,7 +239,7 @@ Acceptance is equivalent to the unsatisfiability of $V(p, \sigma)$ over the whol
 
 Exhaustion establishes only that no parameter in this grammar works. Solver $\mathsf{unknown}$ is reported as unresolved.
 
-\section{Loop contracts}
+\section{Loop contracts}\label{sec:loops}
 
 Let a loop have a one-lap transition $T(\sigma, \sigma')$, extracted from the machine code, a guard $g$, an initial condition $\mathrm{Init}$, an invariant candidate $J$, a postcondition $Q$, and a ranking function $\rho$ into $\N$.
 
@@ -292,7 +296,7 @@ No lattice order on prototypes is claimed under which $\Phi$ is monotone, so con
 Let $\mathtt{leaf}(x,y) = x + y$ take $x$ in $\mathrm{EDI}$ and $y$ in $\mathrm{ESI}$, and suppose the caller sets only $\mathrm{EDI} = 7$ before the call. In its first decompilation, the caller sees one argument. With $m(\mathtt{caller}) = \{(\mathtt{leaf}, \delta(\mathtt{leaf}))\}$, the call becomes binary, and the forwarded $\mathrm{ESI}$ appears as a caller parameter. A hypothesis assigning the first argument to the wrong register is rejected because of the storage mismatch. On rerun, $\eta^\ast = \eta$ and no reanalysis occurs; corrupting $\eta^\ast$ triggers exactly one reanalysis, which restores the same $\eta$.
 \end{example}
 
-\section{Translation unit fibers}
+\section{Translation unit fibers}\label{sec:tu}
 
 At high optimisation levels, inlining, cloning and interprocedural register allocation couple the functions in a translation unit. This section examines how much the compiler fiber still decomposes into per-function pieces.
 
@@ -405,7 +409,7 @@ The refutation test used gcc 15.2 at -O3 on two zstd 1.5.6 translation units. Co
 
 Global coupling does occur, but it is concentrated in a few marginal call sites, leaving $D$ with few free bits in practice. Because a probe deliberately introduces a side effect, these counts may exaggerate the impact of an edit that preserves the summaries.
 
-\section{Thermodynamics of destroyed information}
+\section{Thermodynamics of destroyed information}\label{sec:thermo}
 
 Compilation discards information. The sources
 \[
@@ -495,7 +499,7 @@ All experiments were run with gcc 15.2 at -O3. They are small, exhaustive tests,
 These figures describe a toy space for one function and cannot, on their own, predict recovery from a real binary, where finding any candidate in the first place is the hard part.
 \section{Information inside a function}
 
-Section 9's theorem factors the fiber across functions through the summaries $(a, D)$. Here we ask the same question within a single function: does one source edit alter only a small, local portion of the bytes, or does its effect spread throughout? The answer determines whether a function can be recovered piece by piece or needs to be read as a whole.
+Section~\ref{sec:tu}'s theorem factors the fiber across functions through the summaries $(a, D)$. Here we ask the same question within a single function: does one source edit alter only a small, local portion of the bytes, or does its effect spread throughout? The answer determines whether a function can be recovered piece by piece or needs to be read as a whole.
 
 \subsection{Rewrite groups}
 
@@ -518,12 +522,12 @@ Once the family is large, the connected components of the union of the blobs mer
 \paragraph{Sequential test.} In 26 functions, we fixed a prefix of source lines and varied the rest (337 line variants). Fixing the prefix eliminated 4 exact variants and added none. Among 365 pairs, we found no pair of non exact lines that became exact when combined. Thus, the fiber of a function is close to a product over its lines, even though the bytes affected by a single line are spread throughout the function.
 
 \begin{remark}
-Across functions, the fiber factors through summaries, as in Section 9. Within a function, a single edit's effect is spread across every coordinate we tested, much like a code word, while the set of correct sources remains nearly a product over lines. Recovery should therefore consider the whole function when proposing candidates, then check each line separately when accepting them.
+Across functions, the fiber factors through summaries, as in Section~\ref{sec:tu}. Within a function, a single edit's effect is spread across every coordinate we tested, much like a code word, while the set of correct sources remains nearly a product over lines. Recovery should therefore consider the whole function when proposing candidates, then check each line separately when accepting them.
 \end{remark}
 
 \section{Flags}
 
-As Section 10 shows, destroyed information cannot be recovered; what we can recover is the fiber $C^{-1}(b)$. The register machine preserves the program's dataflow, but not its meaning: a 64-bit value in a register could be a pointer, a size, a count or a truth value. A \emph{flag} is a label that restores some of this meaning. Flags serve two purposes: they determine the source's form before any search begins, and they are checked for consistency across the call graph.
+As Section~\ref{sec:thermo} shows, destroyed information cannot be recovered; what we can recover is the fiber $C^{-1}(b)$. The register machine preserves the program's dataflow, but not its meaning: a 64-bit value in a register could be a pointer, a size, a count or a truth value. A \emph{flag} is a label that restores some of this meaning. Flags serve two purposes: they determine the source's form before any search begins, and they are checked for consistency across the call graph.
 
 \subsection{A hierarchy of levels}
 
@@ -532,7 +536,7 @@ Recovery advances through levels, each fixed before the next and accepted only w
   \item Bytes: instructions and relocations, read directly from the binary.
   \item Dataflow: values, calls and control flow, including clobbered registers, noreturn and tail calls.
   \item Meaning: the type of each value, with flags for return kind, width, signedness, bool, pointer, array extent and structure field.
-  \item Effects: function summaries, namely purity, memory effects, constant parameters and clones. These are the summaries $a$ of Section 9.
+  \item Effects: function summaries, namely purity, memory effects, constant parameters and clones. These are the summaries $a$ of Section~\ref{sec:tu}.
   \item Structure: loops, branches and inlined callees, with flags for loop form, inlined call sites, unrolling and vectorisation.
   \item Names: idioms such as an allocation wrapper, an error code, a size or a context pointer.
   \item Prose: formatting and comments.
@@ -565,9 +569,124 @@ When the recovered prototype is narrower than this least width, callers read bit
 Flags cannot restore the destroyed information $H(s \mid b)$; by data processing, nothing computed from $b$ can. Instead, they correct errors in the parts of the source that the bytes do determine and, together with a readability prior, select which point of the fiber is printed.
 \end{remark}
 
+\section{Core logic}
+
+Earlier sections assess recovery against the strict standard $C_\theta(s) = b$. Here we document a weaker goal: each function's behaviour, and the tools developed to recover it. The motivation is practical: in zstd, one incorrect type costs one instruction and causes the function to count as failed, even if its logic is correct.
+
+\subsection{Logic is constant on the fiber}
+
+Let $\llbracket b \rrbracket$ denote the partial function computed by the bytes $b$ of one function on the machine model, and $\llbracket s \rrbracket$ the partial function assigned by the C standard to a source $s$. Let $D(s)$ denote the set of inputs on which $s$ has defined behaviour. A compiler $C$ is correct if $\llbracket C(s) \rrbracket(x) = \llbracket s \rrbracket(x)$ for every $x \in D(s)$.
+
+\begin{proposition}
+Suppose $C$ is correct and $C(s) = C(s') = b$. Then $\llbracket s \rrbracket$ and $\llbracket s' \rrbracket$ agree on $D(s) \cap D(s')$, and both agree there with $\llbracket b \rrbracket$.
+\end{proposition}
+
+\begin{proof}
+For $x \in D(s) \cap D(s')$, correctness gives $\llbracket s \rrbracket(x) = \llbracket b \rrbracket(x) = \llbracket s' \rrbracket(x)$.
+\end{proof}
+
+Thus, the logic is determined by the bytes alone; no flag is needed to express it. The fiber does not determine anything else, including names, types, or the text's form. The domains $D(s)$ may differ between two members of the fiber, so this statement does not extend to all inputs.
+
+\begin{definition}
+A source $s$ recovers the core logic of $b$ over a set of inputs $X$ if, for some compiler setting $\theta'$, the compiled function $C_{\theta'}(s)$ returns the same value and leaves memory in the same state as $b$ for every $x \in X$.
+\end{definition}
+
+This is the third rung of the ladder from the section on information inside a function: exact bytes, the orbit of a rewrite group, tested behaviour, and then true behaviour. Rice's theorem makes true behaviour undecidable, so tested behaviour is the strongest target below exact bytes that can be checked.
+
+\subsection{Machine typing}
+
+Machine code contains no source types, only widths and operations. A typing that reflects this cannot conflict with the bytes.
+
+\begin{definition}
+A recovered function is machine typed if every variable has an unsigned integer type of width $w \in \{1, 2, 4, 8, 16\}$ bytes, every memory access reads or writes $w$ bytes at an address of the form $p + k$, and every operation whose result depends on signedness (comparison, right shift, extension, division) names its signedness itself.
+\end{definition}
+
+C unsigned arithmetic wraps modulo $2^{8w}$, and byte access can alias any object, so each machine instruction has a machine typed statement with the same effect on the model state. This makes sign a property of operations rather than variables, in keeping with the lattice result below.
+
+One choice, however, is not ours to make. A constant is an address constant if its value changes with the binary's load address. Since the rebuilt program has a different layout, an address constant must be represented as a symbol plus an offset, and the symbols must partition the image into objects.
+
+\begin{proposition}
+Let $P$ be the machine typed translation of a program, with every address constant written as symbol plus offset for a partition $\pi$ of the image into objects. Suppose that in every execution of the original each pointer derived from an address in an object $o \in \pi$ stays inside $o$ or one byte past its end, and that the program subtracts or orders two pointers only when they derive from the same object. Then $P$ computes the same function under every layout that keeps the offsets inside each object.
+\end{proposition}
+
+\begin{proof}
+By induction on the execution. Non address values are equal in both runs because each statement mirrors its instruction. An address value is a pair of an object and an offset, and the offset is equal in both runs. Loads and stores inside an object see the same bytes at the same offsets. A subtraction or order comparison of two addresses has both in one object by hypothesis, so it depends only on the offsets.
+\end{proof}
+
+The hypothesis breaks down if $\pi$ is too fine. In zstd, a pointer one past a string's end had been assigned its own object, losing the distance between a window base and the next source pointer; compression then followed a different path. Merging objects that touch fixes this.
+
+Machine typing rules out incorrect types as a cause of incorrect behaviour. It does not rule out lowering errors, arguments lost to interprocedural register allocation, or code that was never C.
+
+\subsection{A lattice of flags}
+
+For every parameter slot and return, take the product $L = W \times K \times S$, where $W = \{0 < 1 < 2 < 4 < 8\}$ is the width chain, $K = \{\bot < \mathrm{integer} < \mathrm{pointer}\}$ the kind chain, and $S = \{\bot, \mathrm{signed}, \mathrm{unsigned}, \top\}$ is flat. Each use of a slot, within a function or at a call site, supplies a lower bound; forwarding a value between slots imposes an inequality. Since all constraints are monotone, the least fixed point exists, as it does for the return width in the section on flags. An assignment to a slot is sound if it lies below that slot's true flags, and tight if it equals them.
+
+For zstd, which has 2423 parameter slots and 836 returns with source truth, the refined least fixed point yields the following results.
+
+\begin{center}
+\begin{tabular}{lrr}
+component & sound (percent) & tight (percent) \\
+\hline
+parameter width & 100 & 93 \\
+parameter kind & 100 & 76 \\
+parameter sign & 97.9 & 39 \\
+return width & 100 & 51 \\
+return kind & 100 & 48 \\
+\end{tabular}
+\end{center}
+
+Width and kind are sound for every slot. Sign has 18 violations: when the range permits, the compiler emits a signed comparison for an unsigned value, or vice versa, so a use does not provide a bound on sign. Sign therefore belongs on the probabilistic side, along with names and comments. In 22 percent of functions, every slot is tight.
+
+Supplying the true flags to the pipeline instead of the inferred flags raises the byte-exact count from 157 to 177 out of 1139. Flags account for only a small part of exactness; the rest comes from types within functions and source form.
+
+\subsection{Matching against a library}
+
+Fix the true summary $a^*$. The local fiber $L_j(a^*)$ from the section on translation unit fibers is nonempty, because the true source $s^*_j$ belongs to it. Let $\sim_j$ be an equivalence relation on $S_j$, with moves that preserve both the bytes $F_j$ and the summary $\sigma_j$ for every value of the neighbour summaries.
+
+\begin{proposition}
+If a library $\Lambda_j \subseteq S_j$ contains a member of the class of $s^*_j$ under $\sim_j$, then $\Lambda_j \cap L_j(a^*)$ is not empty, and exact comparison finds a member of it.
+\end{proposition}
+
+\begin{proof}
+The class of $s^*_j$ lies inside $L_j(a^*)$ because the moves preserve $F_j$ and $\sigma_j$. Exact comparison of the bytes accepts every member of $L_j(a^*)$, so it accepts that one.
+\end{proof}
+
+Without the hypothesis on $\Lambda_j$, no conclusion is possible. The probabilistic version is this: let a proposer draw candidates from a distribution $q_j$ on $S_j$, and let $m_j = q_j(L_j(a^*))$. If $N$ draws are independent, the probability that at least one falls in the fiber is $1 - (1 - m_j)^N$, and the expected number of draws up to and including the first hit is $1/m_j$. A poor proposer costs extra draws but never compromises correctness, because acceptance relies on exact comparison. The independence of the draws is assumed, not proved.
+
+For zstd, the library consisted of functions already recovered. When each function was left out in turn, transfer recovered 122 of the 128 functions at normal form distance $0$ from another recovered function, and 0 of the 48 beyond that distance. Of the 961 unrecovered functions, only 9 were within distance $0.3$ of a recovered function, and 2 became exact. Among the unrecovered functions, 360 form 91 groups of near copies with no recovered member. A library can therefore multiply seeds, but cannot create them.
+
+\subsection{A behaviour test}
+
+For a function $f$, choose a finite input set $X_f$: integers from a small set and buffers of 4096 pseudo random bytes for pointers. A debugger calls $f$ in both the original and rebuilt programs on each $x \in X_f$, recording the return value at the width specified by the flags and the buffers afterward. Before comparison, values pointing into a buffer are replaced with the pair of buffer index and offset. The verdict is \emph{differ} if, on any input where both calls return, their results differ, or if exactly one call faults; it is \emph{agree} if at least three inputs return on both sides and all results match; otherwise, it is \emph{inconclusive}.
+
+Like the structural tools listed under Limitations, the test is one sided. For a deterministic function, a verdict of differ refutes the candidate and supplies a witness $x$. A verdict of agree establishes only that no difference was detected on $X_f$.
+
+Two controls assess the test itself. Every byte-exact function must either agree or be inconclusive, since its bytes match the original. A function compared with a different function of the same signature should differ.
+
+In zstd run r22, 862 functions were tested using 12 inputs apiece.
+
+\begin{center}
+\begin{tabular}{lrrr}
+ & agree & differ & inconclusive \\
+\hline
+byte exact (157) & 144 & 0 & 13 \\
+not byte exact (705) & 477 & 51 & 177 \\
+\end{tabular}
+\end{center}
+
+The first control passes without failures. In the second, 199 of 250 pairs differ; most of the pairs that agree are genuine near copies, such as the same routine in three legacy format versions. Comparing the original with itself identifies 9 functions as nondeterministic.
+
+Not all agreements are equally strong. Of the 477, 329 agree on at least 8 inputs with at least 4 distinct memory results, while 52 produce a single result, mostly getters and early error returns. Random buffers rarely make a valid frame, so the codec's main path is seldom reached; only the return value and argument buffers are compared. The 329 provide evidence of correct logic, but not proof.
+
+\subsection{Repair with a gate}
+
+A verdict of differ supplies an input $x$ on which the candidate and original disagree. This is a counterexample in the sense used in the section on counterexample-guided synthesis, and the loop works the same way: a proposer receives the disassembly, the candidate, and $x$, then returns a new candidate for the test to accept or reject. The proposer can be any procedure, including a language model, because it is never trusted. The same gate safeguards the final stage, where names, types, and comments are rewritten for readers: an edit is retained only if the function still passes.
+
+The method therefore has three stages. Flags and summaries connect functions across the call graph. Within each local fiber, the decompiler, a library, or a proposer produces a candidate, which is checked either exactly or with the behaviour test. A final pass makes the text readable while retaining the gate.
+
 \section{Limitations}
 
-All results in these notes are proved with respect to the machine model $\Sigma$ and a supplied, rather than inferred, ABI. Accordingly, box containment, the fibers of Section 3 and the loop invariants of Section 7 make no claims about faults, page permissions, concurrency or timing. They hold only if the binary actually uses the stated calling convention.
+All results in these notes are proved with respect to the machine model $\Sigma$ and a supplied, rather than inferred, ABI. Accordingly, box containment, the fibers of Section~\ref{sec:exec} and the loop invariants of Section~\ref{sec:loops} make no claims about faults, page permissions, concurrency or timing. They hold only if the binary actually uses the stated calling convention.
 
 Recovery is judged by the strict standard $C_\theta(s) = b$. A candidate that computes the same function over the modelled domain is classified as semantic agreement, never as recovered source, since different register allocations and instruction selections routinely implement the same function. The reverse gap is equally important: if the search over $\Omega$ runs out of budget, the sole conclusion is that the candidates tested failed. This does not show that no source exists, either within the grammar or outside it.
 
