@@ -797,7 +797,20 @@ static const std::unordered_map<std::string, std::string> &importSignatures() {
         {"abort", "v"}, {"__stack_chk_fail", "v"}, {"__cxa_finalize", "v p"},
         {"qsort", "v p z z p"}, {"time", "l p"}, {"clock_gettime", "i i p"},
         {"stat", "i s p144"}, {"stat64", "i s p144"}, {"lstat", "i s p144"}, {"lstat64", "i s p144"},
-        {"fstat", "i i p144"}, {"fstat64", "i i p144"}, {"sqrt", "d d"}};
+        {"fstat", "i i p144"}, {"fstat64", "i i p144"}, {"sqrt", "d d"},
+        {"sysconf", "l i"}, {"clock", "l"}, {"isatty", "i i"}, {"raise", "i i"}, {"perror", "v s"},
+        {"fgets", "s s i p"}, {"getc", "i p"}, {"ftell", "l p"}, {"fseek", "i p l i"},
+        {"feof", "i p"}, {"ferror", "i p"}, {"setvbuf", "i p s i z"}, {"remove", "i s"},
+        {"chmod", "i s u"}, {"fchmod", "i i u"}, {"chown", "i s u u"}, {"fchown", "i i u u"},
+        {"mkdir", "i s u"}, {"opendir", "p s"}, {"readdir", "p p"}, {"closedir", "i p"},
+        {"mmap", "p p z i i i l"}, {"munmap", "i p z"}, {"setpriority", "i i u i"},
+        {"backtrace", "i p i"}, {"backtrace_symbols", "p p i"}, {"fdopen", "p i s"},
+        {"strstr", "s s s"}, {"__isoc23_strtol", "l s p i"},
+        {"pthread_mutex_lock", "i p"}, {"pthread_mutex_unlock", "i p"},
+        {"pthread_mutex_destroy", "i p"}, {"pthread_cond_signal", "i p"},
+        {"pthread_cond_broadcast", "i p"}, {"pthread_cond_destroy", "i p"},
+        {"pthread_mutex_init", "i p p"}, {"pthread_cond_init", "i p p"},
+        {"pthread_cond_wait", "i p p"}, {"pthread_create", "i p p p p"}, {"pthread_join", "i z p"}};
     return table;
 }
 
