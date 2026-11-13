@@ -1742,6 +1742,7 @@ public:
   void abortSpacebaseRelative(Funcdata &data);
   void finalInputCheck(void);
   void checkInputTrialUse(Funcdata &data,AliasChecker &aliascheck);
+  void promoteWrittenInputs(const vector<int4> &written);	///< Keep in order argument values at an unknown indirect call
   void checkOutputTrialUse(Funcdata &data,vector<Varnode *> &trialvn);
   void buildInputFromTrials(Funcdata &data);
   void buildOutputFromTrials(Funcdata &data,vector<Varnode *> &trialvn);

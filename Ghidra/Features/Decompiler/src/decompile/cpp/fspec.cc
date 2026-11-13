@@ -5566,6 +5566,15 @@ void FuncCallSpecs::finalInputCheck(void)
   }
 }
 
+/// Follow COPY ops back to the Varnode that first holds the value
+static const Varnode *copyRoot(const Varnode *vn)
+
+{
+  for(int4 i=0;i<16 && vn->isWritten() && vn->getDef()->code() == CPUI_COPY;++i)
+    vn = vn->getDef()->getIn(0);
+  return vn;
+}
+
 /// \brief Mark if input trials are being actively used
 ///
 /// Run through each input trial and try to make a determination if the trial is \e active or not,
@@ -5598,6 +5607,8 @@ void FuncCallSpecs::checkInputTrialUse(Funcdata &data,AliasChecker &aliascheck)
   }
 
   AncestorRealistic ancestorReal;
+  bool unknownTarget = (op->code() == CPUI_CALLIND && getFuncdata() == (Funcdata *)0 && hasModel());
+  vector<int4> written;		// Inactive register trials holding a value set in this function
   for(int4 i=0;i<activeinput.getNumTrials();++i) {
     ParamTrial &trial(activeinput.getTrial(i));
     if (trial.isChecked()) continue;
@@ -5630,8 +5641,11 @@ void FuncCallSpecs::checkInputTrialUse(Funcdata &data,AliasChecker &aliascheck)
 	  if (trial.hasCondExeEffect())
 	    activeinput.markNeedsFinalCheck();
 	}
-	else
+	else {
 	  trial.markInactive();
+	  if (unknownTarget && vn->isWritten() && copyRoot(vn) != copyRoot(op->getIn(0)))
+	    written.push_back(i);
+	}
       }
       else if (vn->isInput())	// Not likely a parameter but maybe
 	trial.markInactive();
@@ -5640,6 +5654,34 @@ void FuncCallSpecs::checkInputTrialUse(Funcdata &data,AliasChecker &aliascheck)
     }
     if (trial.isDefinitelyNotUsed())	// If definitely not used, free up the dataflow
       data.opSetInput(op,data.newConstant(vn->getSize(),0),slot);
+  }
+  if (!written.empty())
+    promoteWrittenInputs(written);
+}
+
+/// At an unknown indirect call, keep written values in argument register order while unbroken.
+/// An extra unread argument is harmless, a lost one is not.
+void FuncCallSpecs::promoteWrittenInputs(const vector<int4> &written)
+
+{
+  const ParamListStandard *list = dynamic_cast<const ParamListStandard *>(getModel()->getInputResource());
+  if (list == (const ParamListStandard *)0) return;
+  vector<const ParamEntry *> tiles;
+  list->extractTiles(tiles,TYPECLASS_GENERAL);
+  for(int4 t=0;t<tiles.size();++t) {
+    Address addr(tiles[t]->getSpace(),tiles[t]->getBase());
+    int4 found = -1;
+    for(int4 i=0;i<activeinput.getNumTrials();++i) {
+      if (activeinput.getTrial(i).getAddress() == addr) {
+	found = i;
+	break;
+      }
+    }
+    if (found < 0) return;
+    ParamTrial &trial(activeinput.getTrial(found));
+    if (trial.isActive()) continue;
+    if (find(written.begin(),written.end(),found) == written.end()) return;
+    trial.markActive();
   }
 }
 
