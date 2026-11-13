@@ -1414,6 +1414,7 @@ public:
   bool hasModel(void) const { return (model != (ProtoModel *)0); }	///< Does \b this prototype have a model
 
   bool hasMatchingModel(const ProtoModel *op2) const { return (model == op2); }	///< Does \b this use the given model
+  const ProtoModel *getModel(void) const { return model; }		///< Get the prototype model (may be null)
   const string &getModelName(void) const { return model->getName(); }	///< Get the prototype model name
   int4 getModelExtraPop(void) const { return model->getExtraPop(); }	///< Get the \e extrapop of the prototype model
   bool isModelUnknown(void) const { return model->isUnknown(); }	///< Return \b true if the prototype model is \e unknown

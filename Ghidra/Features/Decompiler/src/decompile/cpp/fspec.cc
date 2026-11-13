@@ -4063,6 +4063,22 @@ void FuncProto::updateInputTypes(Funcdata &data,const vector<Datatype *> &typeLi
   updateThisPointer();
 }
 
+/// Storage of a returned Varnode. A returned input parameter (hidden result pointer) is
+/// reported at the first general return register of the model, never at the parameter register.
+static Address returnStorage(const ProtoModel *model,const Varnode *vn)
+
+{
+  if (model != (const ProtoModel *)0 && vn->isInput() && !model->possibleOutputParam(vn->getAddr(),vn->getSize())) {
+    const ParamListStandard *list = dynamic_cast<const ParamListStandard *>(model->getOutputResource());
+    vector<const ParamEntry *> tiles;
+    if (list != (const ParamListStandard *)0)
+      list->extractTiles(tiles,TYPECLASS_GENERAL);
+    if (!tiles.empty() && tiles[0]->getSize() == vn->getSize())
+      return Address(tiles[0]->getSpace(),tiles[0]->getBase());
+  }
+  return vn->getAddr();
+}
+
 /// \brief Update the return value based on Varnode trials
 ///
 /// If the output parameter is locked, don't do anything. Otherwise,
@@ -4091,7 +4107,7 @@ void FuncProto::updateOutputTypes(const vector<Varnode *> &triallist)
   if (triallist.empty()) return;
   // If we reach here, output is not locked, not sizelocked, and there is a valid trial
   ParameterPieces pieces;
-  pieces.addr = triallist[0]->getAddr();
+  pieces.addr = returnStorage(model,triallist[0]);
   pieces.type = triallist[0]->getHigh()->getType();
   pieces.flags = 0;
   store->setOutput(pieces);
@@ -4115,7 +4131,7 @@ void FuncProto::updateOutputNoTypes(const vector<Varnode *> &triallist,TypeFacto
   }
   ParameterPieces pieces;
   pieces.type = factory->getBase(triallist[0]->getSize(),TYPE_UNKNOWN);
-  pieces.addr = triallist[0]->getAddr();
+  pieces.addr = returnStorage(model,triallist[0]);
   pieces.flags = 0;
   store->setOutput(pieces);
 }

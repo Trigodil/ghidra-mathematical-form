@@ -2052,6 +2052,25 @@ bool Funcdata::ancestorOpUse(int4 maxlevel,const Varnode *invn,
     // A reload from a stack spill just restores the spilled value for a return
     if (op->code()==CPUI_RETURN && def->getIn(0)->getSpace()->getType()==IPTR_SPACEBASE)
       return ancestorOpUse(maxlevel-1,def->getIn(0),op,trial,offset,mainFlags);
+    // A hidden result pointer: first input slot copied to the first output slot and returned
+    if (op->code()==CPUI_RETURN && offset == 0 && funcp.hasModel()) {
+      const Varnode *src = def->getIn(0);
+      if (src->isInput() && !src->isUnaffected() && src->isDirectWrite() && src->getSize() == invn->getSize()) {
+	// Slot numbers count groups of every storage class, so compare against the
+	// first general register entry of the input and output lists instead.
+	vector<const ParamEntry *> inTiles,outTiles;
+	const ParamListStandard *inList = dynamic_cast<const ParamListStandard *>(funcp.getModel()->getInputResource());
+	const ParamListStandard *outList = dynamic_cast<const ParamListStandard *>(funcp.getModel()->getOutputResource());
+	if (inList != (const ParamListStandard *)0 && outList != (const ParamListStandard *)0) {
+	  inList->extractTiles(inTiles,TYPECLASS_GENERAL);
+	  outList->extractTiles(outTiles,TYPECLASS_GENERAL);
+	  if (!inTiles.empty() && !outTiles.empty() &&
+	      inTiles[0]->getSpace() == src->getSpace() && inTiles[0]->getBase() == src->getOffset() &&
+	      outTiles[0]->getSpace() == invn->getSpace() && outTiles[0]->getBase() == invn->getOffset())
+	    return true;
+	}
+      }
+    }
     break;
   case CPUI_PIECE:
     // Concatenation tends to be artificial, so recurse through piece corresponding later SUBPIECE
