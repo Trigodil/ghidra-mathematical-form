@@ -236,6 +236,11 @@ def helper(name):
         else:
             expr = f'((({t})(a^b) & ({t})(a^({t})(a-b))) >> {width*8-1}) & 1'
         return f'static inline bool {name}({t} a, {t} b) {{ return {expr}; }}'
+    match = re.fullmatch(r'BITCAST_((?:u?int|float|xunknown|undefined)\d+)', name)
+    if match:
+        # The decompiler marks a same-size float and integer cast as a bit copy, not a conversion.
+        return (f'#define {name}(x) ({{ __typeof__(x) bc_in_ = (x); {match[1]} bc_out_; '
+                f'__builtin_memcpy(&bc_out_, &bc_in_, sizeof bc_out_); bc_out_; }})')
     if name in ('POPCOUNT', 'LZCOUNT'):
         # sizeof retains the input's original word width; conversion alone would
         # sign-extend narrow negative operands and produce incorrect counts.
@@ -257,7 +262,7 @@ def replace_identifiers(text, replacements):
 
 
 VECTOR_ELEMENT = r'(?:xunknown1|undefined1)'
-HELPER_CALLEE = re.compile(r'(?:CONCAT|SUB|SEXT|ZEXT|CARRY|SCARRY|SBORROW)\d+|POPCOUNT|LZCOUNT')
+HELPER_CALLEE = re.compile(r'(?:CONCAT|SUB|SEXT|ZEXT|CARRY|SCARRY|SBORROW)\d+|POPCOUNT|LZCOUNT|BITCAST_\w+')
 
 
 def element_address(text, match, name):
@@ -265,14 +270,14 @@ def element_address(text, match, name):
     before, after = text[:match.start()].rstrip(), text[match.end():].lstrip()
     if re.search(r'\*\s*\)$', before):
         return f'((xunknown1 *)&{name}[{match[1]}])'
+    # Arithmetic or a comparison on an array operand is arithmetic on its decayed address.
+    if re.match(r'[-+*/%<>&|^]|[=!]=', after):
+        return f'((xunknown1 *)&{name}[{match[1]}])'
     if re.match(r'=(?!=)', after) or re.search(r'(?<![=!<>+\-*/%&|^])=$|\breturn$', before):
         return match[0]
     return f'((xunknown1 *)&{name}[{match[1]}])'
 
 
-    # Arithmetic or a comparison on an array operand is arithmetic on its decayed address.
-    if re.match(r'[-+*/%<>&|^]|[=!]=', after):
-        return f'((xunknown1 *)&{name}[{match[1]}])'
 def lower_vectors(text):
     """Lower the array type xunknown1 [16] to the word xunknown16 (unsigned __int128).
 
@@ -294,14 +299,14 @@ def lower_vectors(text):
             # A word cast to a pointer type can only mean the array's address.
             if re.search(r'\(\s*[A-Za-z_][\w\s]*\*[\s*]*\)$', before):
                 return True
+            # Pointer arithmetic on the array operand (name + k, p - name) is its address.
+            if re.match(r'[-+](?![-+=])', after) or re.search(r'[^-+][-+]$', before):
+                return True
             if before[-1:] in '(,' and after[:1] in ',)':
                 depth, index = 0, len(before) - 1
                 while index >= 0:
                     depth += {')': 1, '(': -1}.get(before[index], 0)
                     if depth < 0:
-            # Pointer arithmetic on the array operand (name + k, p - name) is its address.
-            if re.match(r'[-+](?![-+=])', after) or re.search(r'[^-+][-+]$', before):
-                return True
                         break
                     index -= 1
                 callee = re.search(r'(\w+)\s*$', before[:index])
@@ -319,12 +324,6 @@ def lower_vectors(text):
         else:
             buffers.append(match)
     # A buffer that is also copied whole to or from a word keeps its address; the copy is explicit.
-    for match in buffers:
-        name = re.escape(match[1])
-        zero = re.compile(r'\(\s*' + VECTOR_ELEMENT + r'\s*\[\s*(\d+)\s*\]\s*\)\s*0x0\s*')
-        copies = [(m.start(), m.end(), f'__builtin_memset({match[1]}, 0, {zero.fullmatch(m[1])[1]});' if zero.fullmatch(m[1])
-                   else '__builtin_memcpy({0}, &(__typeof__({1})){{{1}}}, sizeof({1}));'.format(
-                       match[1], lowered(m.start(1), m.end(1))))
     cast_edits = list(edits)
 
     def lowered(start, end):
@@ -335,6 +334,12 @@ def lower_vectors(text):
             part = part[:s - start] + value + part[e - start:]
         return part
 
+    for match in buffers:
+        name = re.escape(match[1])
+        zero = re.compile(r'\(\s*' + VECTOR_ELEMENT + r'\s*\[\s*(\d+)\s*\]\s*\)\s*0x0\s*')
+        copies = [(m.start(), m.end(), f'__builtin_memset({match[1]}, 0, {zero.fullmatch(m[1])[1]});' if zero.fullmatch(m[1])
+                   else '__builtin_memcpy({0}, &(__typeof__({1})){{{1}}}, sizeof({1}));'.format(
+                       match[1], lowered(m.start(1), m.end(1))))
                   for m in re.finditer(rf'(?m)^[ \t]*{name}[ \t]*=(?!=)[ \t]*([^;{{}}]+);', masked)]
         copies += [(m.start(), m.end(), f'__builtin_memcpy(&({m[1]}), {match[1]}, sizeof({m[1]}));')
                    for m in re.finditer(rf'(?m)^[ \t]*([A-Za-z_]\w*)[ \t]*=[ \t]*{name};', masked)]
@@ -342,13 +347,13 @@ def lower_vectors(text):
             # The word is 16 bytes, so the buffer must hold one whole.
             edits.append((match.start(), match.end(), f'xunknown1 {match[1]} [16];'))
             edits.extend(copies)
+    # An edit inside a larger edit (a cast inside a whole-buffer copy) is replaced with it.
+    edits = [e for e in edits if not any(o != e and o[0] <= e[0] and e[1] <= o[1] for o in edits)]
     for start, end, value in sorted(edits, reverse=True):
         text = text[:start] + value + text[end:]
     # Byte indexing: p[k][i] and (*p)[i] on a pointer, w[i] on a word.
     for name in sorted(words):
         escaped = re.escape(name)
-    # An edit inside a larger edit (a cast inside a whole-buffer copy) is replaced with it.
-    edits = [e for e in edits if not any(o != e and o[0] <= e[0] and e[1] <= o[1] for o in edits)]
         if name in pointers:
             text = re.sub(rf'\(\s*\*\s*{escaped}\s*\)\s*\[', f'((xunknown1 *){name})[', text)
             text = re.sub(rf'\b{escaped}\s*\[([^\[\]]*)\]\s*\[', rf'((xunknown1 *)&{name}[\1])[', text)
@@ -990,7 +995,7 @@ def assemble(binary_report):
             storage.append(dict(address=address, **detail))
     source = '\n'.join(transformed)
     tokens = set(WORD.findall(code_mask(source)))
-    required = sorted(t for t in tokens if re.fullmatch(r'(?:CONCAT|SUB|SEXT|ZEXT|CARRY|SCARRY|SBORROW)\d+|POPCOUNT|LZCOUNT', t))
+    required = sorted(t for t in tokens if re.fullmatch(r'(?:CONCAT|SUB|SEXT|ZEXT|CARRY|SCARRY|SBORROW)\d+|POPCOUNT|LZCOUNT|BITCAST_\w+', t))
     implementations, unsupported = [], []
     for name in required:
         implementation = helper(name)
@@ -1037,15 +1042,15 @@ def assemble(binary_report):
                                                               code_mask(source), image)
     # Local symbols such as __PRETTY_FUNCTION__.18 are renamed like the function clones.
     globals_source = clone_identifiers(globals_source)
+    past_end = global_metadata.get('past_end', {})
+    if past_end:
+        transformed = [global_state.rewrite_past_end(t, code_mask(t), past_end) for t in transformed]
+        source = '\n'.join(transformed)
     declared = [clone_identifiers(name) for name in
                 global_metadata['exported_globals'] + global_metadata['external_globals']]
     missing_source, missing_names = global_state.declare_missing(code_mask(source), set(declared))
     global_metadata['name_declared_globals'] = missing_names
     globals_source = '\n'.join(filter(None, [globals_source, missing_source]))
-    past_end = global_metadata.get('past_end', {})
-    if past_end:
-        transformed = [global_state.rewrite_past_end(t, code_mask(t), past_end) for t in transformed]
-        source = '\n'.join(transformed)
     # Avoid accepting implicit int-return declarations for cross-function calls.
     program = '#include "recovered_support.h"\n\n' + stack_structs(base, binary_report, source) + '\n'.join(prototypes) + '\n\n' + globals_source + '\n\n' + source
     metadata = dict(function_count=len(bodies), missing_functions=missing,

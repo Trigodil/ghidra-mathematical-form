@@ -476,6 +476,17 @@ void PrintC::opTypeCast(const PcodeOp *op)
     }
   }
   if (!option_nocasts) {
+    // A CAST between float and non-float of one size keeps the bits; C would convert the value.
+    Datatype *src = op->getIn(0)->getHighTypeReadFacing(op);
+    type_metatype outMeta = dt->getMetatype();
+    type_metatype inMeta = src->getMetatype();
+    if ((outMeta == TYPE_FLOAT) != (inMeta == TYPE_FLOAT) && outMeta != TYPE_PTR && inMeta != TYPE_PTR &&
+	dt->getSize() == src->getSize() && dt->getSize() >= 4) {
+      pushOp(&function_call,op);
+      pushAtom(Atom("BITCAST_" + dt->getName(),optoken,EmitMarkup::no_color,op));
+      pushVn(op->getIn(0),op,mods);
+      return;
+    }
     pushOp(&typecast,op);
     pushType(dt);
   }
