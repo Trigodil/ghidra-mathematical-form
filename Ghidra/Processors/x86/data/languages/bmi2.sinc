@@ -7,11 +7,11 @@
 {
   indexTmp:1 = vexVVVV_r32:1;
 
-  # saturate index amount to 32; operand size or higher does not clear any bits
-  shift:1 = (indexTmp <= 32) * (32 - indexTmp);
-
-  # clear the upper bits
-  Reg32 = (rm32 << shift) >> shift;
+  # keep the low indexTmp bits; index 32 or higher keeps all
+  # every shift count stays below 32, so the C form has the same meaning
+  low:4 = (1 << (indexTmp & 31)) - 1;
+  keep:4 = 0 - zext(indexTmp > 31);
+  Reg32 = rm32 & (low | keep);
   build check_Reg32_dest;
 
   ZF = (Reg32 == 0);
@@ -26,11 +26,11 @@
 {
   indexTmp:1 = vexVVVV_r64:1;
 
-  # saturate index amount to 64; operand size or higher does not clear any bits
-  shift:1 = (indexTmp <= 64) * (64 - indexTmp);
-
-  # clear the upper bits
-  Reg64 = (rm64 << shift) >> shift;
+  # keep the low indexTmp bits; index 64 or higher keeps all
+  # every shift count stays below 64, so the C form has the same meaning
+  low:8 = (1 << (indexTmp & 63)) - 1;
+  keep:8 = 0 - zext(indexTmp > 63);
+  Reg64 = rm64 & (low | keep);
 
   ZF = (Reg64 == 0);
   SF = (Reg64 s< 0);
