@@ -2619,16 +2619,18 @@ with : lockprefx=0 {
     bitIndex:2 = 0;
 
     ZF = ( rm16 == 0 );
-    
-    if ( ZF == 1 ) goto <done>;
-     
+
+    # Hardware leaves the destination unchanged for a zero source.
+    if ( ZF == 1 ) goto <zero>;
+
 <start>
     if ( ((rm16 >> bitIndex) & 0x0001) != 0 ) goto <done>;
       bitIndex = bitIndex + 1;
     goto <start>;
-    
+
 <done>
     Reg16 = bitIndex;
+<zero>
 }                             
 
 #:BSF Reg32,rm32     is vexMode=0 & opsize=1 & byte=0xf; byte=0xbc; rm32 & Reg32 ... & check_Reg32_dest ...      { ZF = rm32 == 0;                 
@@ -2659,16 +2661,18 @@ with : lockprefx=0 {
     bitIndex:4 = 0;
 
     ZF = ( rm32 == 0 );
-    
-    if ( ZF == 1 ) goto <done>;
-     
+
+    # Hardware leaves the destination unchanged for a zero source.
+    if ( ZF == 1 ) goto <zero>;
+
 <start>
     if ( ((rm32 >> bitIndex) & 0x00000001) != 0 ) goto <done>;
       bitIndex = bitIndex + 1;
     goto <start>;
-    
+
 <done>
     Reg32 = bitIndex;
+<zero>
     build check_Reg32_dest;
 }                             
                             
@@ -2701,16 +2705,18 @@ with : lockprefx=0 {
     bitIndex:8 = 0;
 
     ZF = ( rm64 == 0 );
-    
-    if ( ZF == 1 ) goto <done>;
-     
+
+    # Hardware leaves the destination unchanged for a zero source.
+    if ( ZF == 1 ) goto <zero>;
+
 <start>
     if ( ((rm64 >> bitIndex) & 0x0000000000000001) != 0 ) goto <done>;
       bitIndex = bitIndex + 1;
     goto <start>;
-    
+
 <done>
     Reg64 = bitIndex;
+<zero>
 }                             
 @endif
 
@@ -2736,16 +2742,18 @@ with : lockprefx=0 {
     bitIndex:2 = 15;
 
     ZF = ( rm16 == 0 );
-    
-    if ( ZF == 1 ) goto <done>;
-     
+
+    # Hardware leaves the destination unchanged for a zero source.
+    if ( ZF == 1 ) goto <zero>;
+
 <start>
     if ( (rm16 >> bitIndex) != 0 ) goto <done>;
       bitIndex = bitIndex - 1;
     goto <start>;
-    
+
 <done>
     Reg16 = bitIndex;
+<zero>
 }                             
 
 #:BSR Reg32,rm32     is vexMode=0 & opsize=1 & byte=0xf; byte=0xbd; rm32 & Reg32 ... & check_Reg32_dest ... { ZF = rm32 == 0;                         
@@ -2776,16 +2784,18 @@ with : lockprefx=0 {
     bitIndex:4 = 31;
 
     ZF = ( rm32 == 0 );
-    
-    if ( ZF == 1 ) goto <done>;
-     
+
+    # Hardware leaves the destination unchanged for a zero source.
+    if ( ZF == 1 ) goto <zero>;
+
 <start>
     if ( (rm32 >> bitIndex) != 0 ) goto <done>;
       bitIndex = bitIndex - 1;
     goto <start>;
-    
+
 <done>
     Reg32 = bitIndex;
+<zero>
     build check_Reg32_dest;
 }                             
 
@@ -2819,16 +2829,18 @@ with : lockprefx=0 {
     bitIndex:8 = 63;
 
     ZF = ( rm64 == 0 );
-    
-    if ( ZF == 1 ) goto <done>;
-     
+
+    # Hardware leaves the destination unchanged for a zero source.
+    if ( ZF == 1 ) goto <zero>;
+
 <start>
     if ( (rm64 >> bitIndex) != 0 ) goto <done>;
       bitIndex = bitIndex - 1;
     goto <start>;
-    
+
 <done>
     Reg64 = bitIndex;
+<zero>
 }                             
 
 @endif
