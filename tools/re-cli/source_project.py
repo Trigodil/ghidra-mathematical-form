@@ -278,6 +278,14 @@ def element_address(text, match, name):
     return f'((xunknown1 *)&{name}[{match[1]}])'
 
 
+def decayed_store(text, match, name):
+    """x = *p with x declared as a pointer: the array *p decays to the address p."""
+    decl = re.search(rf'(?m)^[ \t]*(?!return\b|case\b|goto\b)([A-Za-z_][\w \t]*?[ \t]*\*[ \t*]*){match[2]}[ \t]*;', text)
+    if not decl:
+        return match[0]
+    return f'{match[1]}{match[2]}{match[3]}({decl[1].strip()}){name};'
+
+
 def lower_vectors(text):
     """Lower the array type xunknown1 [16] to the word xunknown16 (unsigned __int128).
 
@@ -362,6 +370,9 @@ def lower_vectors(text):
             text = re.sub(rf'([(,]\s*)\*\s*{escaped}\b(?=\s*[+-])', rf'\1((xunknown1 *){name})', text)
             # An integer cast of *p is pointer arithmetic on the decayed address.
             text = re.sub(rf'(\(\s*u?int\d*\s*\)\s*)\*\s*{escaped}\b(?!\s*[\[.])', rf'\1((xunknown1 *){name})', text)
+            # *p stored to a pointer variable is the decayed address, not a load of the word.
+            text = re.sub(rf'(?m)^([ \t]*)(\w+)([ \t]*=[ \t]*)\*\s*{escaped}[ \t]*;',
+                          lambda m: decayed_store(text, m, name), text)
             # A bare element p[k] is an array that decays to the address of that element.
             text = re.sub(rf'(?<![\w.&]){escaped}\s*\[([^\[\]]*)\]', lambda m: element_address(text, m, name), text)
         else:
