@@ -327,7 +327,7 @@ public:
   virtual void opFloatSqrt(const PcodeOp *op) { opFunc(op); }
   virtual void opFloatInt2Float(const PcodeOp *op);
   virtual void opFloatFloat2Float(const PcodeOp *op) { opTypeCast(op); }
-  virtual void opFloatTrunc(const PcodeOp *op) { opTypeCast(op); }
+  virtual void opFloatTrunc(const PcodeOp *op);
   virtual void opFloatCeil(const PcodeOp *op) { opFunc(op); }
   virtual void opFloatFloor(const PcodeOp *op) { opFunc(op); }
   virtual void opFloatRound(const PcodeOp *op) { opFunc(op); }

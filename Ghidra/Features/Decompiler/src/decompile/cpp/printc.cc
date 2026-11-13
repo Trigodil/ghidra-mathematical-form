@@ -477,10 +477,12 @@ void PrintC::opTypeCast(const PcodeOp *op)
   }
   if (!option_nocasts) {
     // A CAST between float and non-float of one size keeps the bits; C would convert the value.
+    // Only a CAST op moves bits; FLOAT_TRUNC and friends also print here and convert.
     Datatype *src = op->getIn(0)->getHighTypeReadFacing(op);
     type_metatype outMeta = dt->getMetatype();
     type_metatype inMeta = src->getMetatype();
-    if ((outMeta == TYPE_FLOAT) != (inMeta == TYPE_FLOAT) && outMeta != TYPE_PTR && inMeta != TYPE_PTR &&
+    if (op->code() == CPUI_CAST &&
+	(outMeta == TYPE_FLOAT) != (inMeta == TYPE_FLOAT) && outMeta != TYPE_PTR && inMeta != TYPE_PTR &&
 	dt->getSize() == src->getSize() && dt->getSize() >= 4) {
       pushOp(&function_call,op);
       pushAtom(Atom("BITCAST_" + dt->getName(),optoken,EmitMarkup::no_color,op));
@@ -855,6 +857,23 @@ void PrintC::opBoolNegate(const PcodeOp *op)
     pushOp(&boolean_not,op);	// Otherwise print ourselves
     pushVn(op->getIn(0),op,mods); // And print our input
   }
+}
+
+/// FLOAT_TRUNC is a signed truncation (cvttsd2si); for an unsigned result
+/// print it through the signed type of the same size, as the machine does.
+void PrintC::opFloatTrunc(const PcodeOp *op)
+
+{
+  Datatype *dt = op->getOut()->getHighTypeDefFacing();
+  if (option_nocasts || dt->getMetatype() != TYPE_UINT) {
+    opTypeCast(op);
+    return;
+  }
+  pushOp(&typecast,op);
+  pushType(dt);
+  pushOp(&typecast,op);
+  pushType(glb->types->getBase(dt->getSize(),TYPE_INT));
+  pushVn(op->getIn(0),op,mods);
 }
 
 void PrintC::opFloatInt2Float(const PcodeOp *op)
