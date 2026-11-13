@@ -270,6 +270,9 @@ def element_address(text, match, name):
     return f'((xunknown1 *)&{name}[{match[1]}])'
 
 
+    # Arithmetic or a comparison on an array operand is arithmetic on its decayed address.
+    if re.match(r'[-+*/%<>&|^]|[=!]=', after):
+        return f'((xunknown1 *)&{name}[{match[1]}])'
 def lower_vectors(text):
     """Lower the array type xunknown1 [16] to the word xunknown16 (unsigned __int128).
 
@@ -296,6 +299,9 @@ def lower_vectors(text):
                 while index >= 0:
                     depth += {')': 1, '(': -1}.get(before[index], 0)
                     if depth < 0:
+            # Pointer arithmetic on the array operand (name + k, p - name) is its address.
+            if re.match(r'[-+](?![-+=])', after) or re.search(r'[^-+][-+]$', before):
+                return True
                         break
                     index -= 1
                 callee = re.search(r'(\w+)\s*$', before[:index])
@@ -317,7 +323,18 @@ def lower_vectors(text):
         name = re.escape(match[1])
         zero = re.compile(r'\(\s*' + VECTOR_ELEMENT + r'\s*\[\s*(\d+)\s*\]\s*\)\s*0x0\s*')
         copies = [(m.start(), m.end(), f'__builtin_memset({match[1]}, 0, {zero.fullmatch(m[1])[1]});' if zero.fullmatch(m[1])
-                   else f'__builtin_memcpy({match[1]}, &(__typeof__({m[1]})){{{m[1]}}}, sizeof({m[1]}));')
+                   else '__builtin_memcpy({0}, &(__typeof__({1})){{{1}}}, sizeof({1}));'.format(
+                       match[1], lowered(m.start(1), m.end(1))))
+    cast_edits = list(edits)
+
+    def lowered(start, end):
+        # Source text of a span with the cast edits inside it applied.
+        inner = sorted((e for e in cast_edits if start <= e[0] and e[1] <= end), reverse=True)
+        part = text[start:end]
+        for s, e, value in inner:
+            part = part[:s - start] + value + part[e - start:]
+        return part
+
                   for m in re.finditer(rf'(?m)^[ \t]*{name}[ \t]*=(?!=)[ \t]*([^;{{}}]+);', masked)]
         copies += [(m.start(), m.end(), f'__builtin_memcpy(&({m[1]}), {match[1]}, sizeof({m[1]}));')
                    for m in re.finditer(rf'(?m)^[ \t]*([A-Za-z_]\w*)[ \t]*=[ \t]*{name};', masked)]
@@ -330,6 +347,8 @@ def lower_vectors(text):
     # Byte indexing: p[k][i] and (*p)[i] on a pointer, w[i] on a word.
     for name in sorted(words):
         escaped = re.escape(name)
+    # An edit inside a larger edit (a cast inside a whole-buffer copy) is replaced with it.
+    edits = [e for e in edits if not any(o != e and o[0] <= e[0] and e[1] <= o[1] for o in edits)]
         if name in pointers:
             text = re.sub(rf'\(\s*\*\s*{escaped}\s*\)\s*\[', f'((xunknown1 *){name})[', text)
             text = re.sub(rf'\b{escaped}\s*\[([^\[\]]*)\]\s*\[', rf'((xunknown1 *)&{name}[\1])[', text)
@@ -1023,6 +1042,10 @@ def assemble(binary_report):
     missing_source, missing_names = global_state.declare_missing(code_mask(source), set(declared))
     global_metadata['name_declared_globals'] = missing_names
     globals_source = '\n'.join(filter(None, [globals_source, missing_source]))
+    past_end = global_metadata.get('past_end', {})
+    if past_end:
+        transformed = [global_state.rewrite_past_end(t, code_mask(t), past_end) for t in transformed]
+        source = '\n'.join(transformed)
     # Avoid accepting implicit int-return declarations for cross-function calls.
     program = '#include "recovered_support.h"\n\n' + stack_structs(base, binary_report, source) + '\n'.join(prototypes) + '\n\n' + globals_source + '\n\n' + source
     metadata = dict(function_count=len(bodies), missing_functions=missing,

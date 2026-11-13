@@ -565,13 +565,44 @@ def recover(base, rows, functions=None, source="", image=None):
         ):
             declarations.append("extern " + declaration)
             external.append(name)
+    # An object that starts where another ends: a pointer to it may be the other's end.
+    past_end = {}
+    for record in address_objects:
+        if record["name"] in blocked or record["name"] not in exported:
+            continue
+        before = [o for o in address_objects if o["address"] + o["size"] == record["address"]
+                  and o["name"] != record["name"] and o["name"] in exported]
+        if before:
+            other = min(before, key=lambda r: (r["size"], r["name"]))
+            past_end[record["name"]] = [other["name"], other["size"]]
     return "\n".join(declarations), dict(
+        past_end=past_end,
         exported_globals=exported,
         external_globals=external,
         obligations=obligations,
         functions_without_metadata=metadata_missing,
         source_global_equivalence_proved=False,
     )
+
+
+def rewrite_past_end(text, mask, past_end):
+    """Keep a loop end that is one past an object inside that object, not the next symbol.
+
+    The address of the next global is read as the end of PREV when a pointer
+    set from PREV in the same function is compared with it.
+    """
+    for symbol, (prev, size) in sorted(past_end.items()):
+        pattern = re.compile(
+            r"(\b(\w+)\s*(?:!=|==|<=|>=|<|>)\s*(?:\([^()]*\*\s*\)\s*)?)(" + re.escape(symbol) + r")\b(?!\s*[\[(.])")
+        edits = []
+        for match in pattern.finditer(mask):
+            start = r"\b" + re.escape(match[2]) + r"\s*=\s*(?:\([^()]*\)\s*)?(?:&\s*)?" + re.escape(prev) + r"\b"
+            if re.search(start, mask):
+                edits.append((match.start(3), match.end(3)))
+        for begin, end in sorted(edits, reverse=True):
+            text = text[:begin] + f"((char *){prev} + {size})" + text[end:]
+            mask = mask[:begin] + f"((char *){prev} + {size})" + mask[end:]
+    return text
 
 
 GHIDRA_GLOBAL = re.compile(r"\b([a-z]{1,3})Ram([0-9a-f]{16})\b")
