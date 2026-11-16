@@ -10,6 +10,7 @@ from elf_image import Elf
 import global_state
 import abi_evidence
 import machine_types
+import code_blobs
 
 NONCODE = re.compile(r'/\*[\s\S]*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 WORD = re.compile(r'\b[A-Za-z_][A-Za-z_0-9]*\b')
@@ -1005,6 +1006,13 @@ def assemble(binary_report):
         if detail['promoted_storage'] or detail['unresolved_slices']:
             storage.append(dict(address=address, **detail))
     source = '\n'.join(transformed)
+    # Code reached only by address constants becomes raw byte blobs with labels.
+    blob_source, blob_declarations, blob_labels, blob_metadata = code_blobs.recover(
+        image, source, binary_report.get('functions', []),
+        set(WORD.findall(code_mask(source))) | set(definitions.values()))
+    if blob_labels:
+        transformed = [code_blobs.rewrite(t, blob_labels) for t in transformed]
+        source = '\n'.join(transformed)
     tokens = set(WORD.findall(code_mask(source)))
     required = sorted(t for t in tokens if re.fullmatch(r'(?:CONCAT|SUB|SEXT|ZEXT|CARRY|SCARRY|SBORROW)\d+|POPCOUNT|LZCOUNT|BITCAST_\w+', t))
     implementations, unsupported = [], []
@@ -1059,11 +1067,13 @@ def assemble(binary_report):
         source = '\n'.join(transformed)
     declared = [clone_identifiers(name) for name in
                 global_metadata['exported_globals'] + global_metadata['external_globals']]
-    missing_source, missing_names = global_state.declare_missing(code_mask(source), set(declared))
+    missing_source, missing_names = global_state.declare_missing(code_mask(source),
+                                                                 set(declared) | set(blob_labels.values()))
     global_metadata['name_declared_globals'] = missing_names
     globals_source = '\n'.join(filter(None, [globals_source, missing_source]))
     # Avoid accepting implicit int-return declarations for cross-function calls.
-    program = '#include "recovered_support.h"\n\n' + stack_structs(base, binary_report, source) + '\n'.join(prototypes) + '\n\n' + globals_source + '\n\n' + source
+    blobs = blob_declarations + '\n' + blob_source + '\n' if blob_source else ''
+    program = '#include "recovered_support.h"\n\n' + stack_structs(base, binary_report, source) + '\n'.join(prototypes) + '\n\n' + blobs + globals_source + '\n\n' + source
     metadata = dict(function_count=len(bodies), missing_functions=missing,
                     toolchain_runtime_excluded=sorted(excluded),
                     imports_called=sorted(called_imports),
@@ -1074,7 +1084,7 @@ def assemble(binary_report):
                     renamed_identifiers=renames, storage_lowering=storage, frame_lowering=frames,
                     slice_widths=sorted(slice_widths), odd_widths_lowered=sorted(odd_widths),
                     unresolved_odd_width_types=sorted(t for t in tokens if re.fullmatch(r'unk(?:u)?int\d+', t)),
-                    global_state=global_metadata,
+                    global_state=global_metadata, code_blobs=blob_metadata,
                     abi_evidence=abi_evidence.compare(base, binary_report.get('functions', [])),
                     semantic_equivalence_proved=False)
     if machine is not None:

@@ -75,6 +75,7 @@ def install(prefix, repo):
         "global_state.py",
         "abi_evidence.py",
         "machine_types.py",
+        "code_blobs.py",
         "elf_image.py",
         "bin/re-",
     ):

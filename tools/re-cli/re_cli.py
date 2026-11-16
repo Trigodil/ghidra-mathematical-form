@@ -255,6 +255,7 @@ class Workflow:
                               HERE / 'full_recovery.py', HERE / 'recovery_build.py',
                               HERE / 'source_project.py',
                               HERE / 'global_state.py', HERE / 'abi_evidence.py',
+                              HERE / 'code_blobs.py',
                               Path('/usr/bin/objdump')]):
             fingerprint.update(str(source).encode())
             fingerprint.update(bytes.fromhex(digest(source)))
