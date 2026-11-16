@@ -686,9 +686,19 @@ static void applyPrototypeSeeds(StaticElfArchitecture &arch, ghidra::Scope *scop
             std::vector<SeedStorage> expected;
             bool noReturn = false;
             std::string stackSeed;
+            std::vector<ghidra::VarnodeData> kept;
             for (size_t i = 2; i < fields.size(); ++i) {
                 if (fields[i] == "noreturn") noReturn = true;
                 else if (fields[i].compare(0, 6, "stack=") == 0) stackSeed = fields[i].substr(6);
+                else if (fields[i].compare(0, 5, "keep=") == 0) {
+                    // Return registers the callee never writes (ipa-ra); callers keep them.
+                    std::istringstream names(fields[i].substr(5));
+                    std::string name;
+                    while (std::getline(names, name, ',')) {
+                        if (name != "RDX" && name != "XMM0") throw std::runtime_error("invalid keep register");
+                        kept.push_back(arch.translate->getRegister(name));
+                    }
+                }
                 else expected.push_back(parseSeedStorage(arch, fields[i]));
             }
             if (expected.empty()) throw std::runtime_error("invalid row");
@@ -763,6 +773,7 @@ static void applyPrototypeSeeds(StaticElfArchitecture &arch, ghidra::Scope *scop
             if (fd == nullptr) throw std::runtime_error("cannot create function");
             fd->getFuncProto().setPieces(pieces);
             if (noReturn) fd->getFuncProto().setNoReturn(true);
+            for (const auto &storage : kept) fd->getFuncProto().addUnaffected(storage);
             results << fields[0] << "\tapplied\n";
         } catch (const std::exception &error) {
             results << rowTarget << "\trejected\t" << error.what() << "\n";

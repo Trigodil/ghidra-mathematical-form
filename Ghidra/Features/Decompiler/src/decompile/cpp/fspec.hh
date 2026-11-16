@@ -1408,6 +1408,7 @@ public:
   void copyFlowEffects(const FuncProto &op2);	 			///< Copy properties that affect data-flow
   void getPieces(PrototypePieces &pieces) const;			///< Get the raw pieces of the prototype
   void setPieces(const PrototypePieces &pieces);			///< Set \b this prototype based on raw pieces
+  void addUnaffected(const VarnodeData &storage);	///< Mark a range as preserved across calls to \b this
   void setScope(Scope *s,const Address &startpoint);			///< Set a backing symbol Scope for \b this
   void setInternal(ProtoModel *m,Datatype *vt);				///< Set internal backing storage for \b this
   void setModel(ProtoModel *m);						///< Set the prototype model for \b this

@@ -3846,6 +3846,15 @@ void FuncProto::setPieces(const PrototypePieces &pieces)
   setModelLock(true);
 }
 
+/// The override merges with the model effects, as a decoded \<unaffected> list does.
+/// \param storage is the register or memory range the function never writes
+void FuncProto::addUnaffected(const VarnodeData &storage)
+
+{
+  effectlist.push_back(EffectRecord(storage,EffectRecord::unaffected));
+  decodeEffect();
+}
+
 /// Copy out the raw pieces of \b this prototype as stand-alone objects,
 /// includings model, names, and data-types
 /// \param pieces will hold the raw pieces

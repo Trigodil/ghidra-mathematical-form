@@ -7,6 +7,7 @@ import json
 import os
 import re
 from pathlib import Path
+import register_effects
 
 
 def read_evidence(path):
@@ -325,6 +326,7 @@ def seed_manifests(base, rows, imports=()):
         with open(Path(base) / 'flag-override.jsonl', 'a') as log:
             log.write(json.dumps(dict(sorted(stats.items()))) + '\n')
 
+    preserved = register_effects.kept(base, rows, imports)
     result = {}
     for caller, targets in by_caller.items():
         lines = []
@@ -372,6 +374,8 @@ def seed_manifests(base, rows, imports=()):
                     [f"{f['offset']:x}.{f['size']}.{f['type_descriptor']}" for f in block['fields']]))
             if proven_noreturn(base, target):
                 fields.append('noreturn')
+            if preserved.get(target):
+                fields.append('keep=' + ','.join(preserved[target]))
             lines.append('\t'.join(fields))
             accepted.append(target)
         result[caller] = ('\n'.join(lines) + ('\n' if lines else ''),

@@ -76,6 +76,7 @@ def install(prefix, repo):
         "abi_evidence.py",
         "machine_types.py",
         "code_blobs.py",
+        "register_effects.py",
         "elf_image.py",
         "bin/re-",
     ):
