@@ -439,6 +439,8 @@ def recover(
             if profile["compiler"] in ("gcc", "g++")
             else "-ferror-limit=20"
         )
+        # Sizes and counters can be typed as pointers; pointer overflow rules would drop loop exits.
+        wrap_pointer = ["-fwrapv-pointer"] if profile["compiler"] in ("gcc", "g++") else []
         command = [
             str(compiler),
             diagnostic_limit,
@@ -446,6 +448,7 @@ def recover(
             *profile.get("flags", []),
             # Recovered code is type punned; TBAA would miscompile it.
             "-fno-strict-aliasing",
+            *wrap_pointer,
             "-o",
             "rebuilt.elf",
         ]
