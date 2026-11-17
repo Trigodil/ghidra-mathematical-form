@@ -439,8 +439,9 @@ def recover(
             if profile["compiler"] in ("gcc", "g++")
             else "-ferror-limit=20"
         )
+        # P-code arithmetic wraps; signed overflow UB lets gcc fold (x * 0x100 == y * 0x100) to x == y.
         # Sizes and counters can be typed as pointers; pointer overflow rules would drop loop exits.
-        wrap_pointer = ["-fwrapv-pointer"] if profile["compiler"] in ("gcc", "g++") else []
+        wrap_pointer = ["-fwrapv", "-fwrapv-pointer"] if profile["compiler"] in ("gcc", "g++") else ["-fwrapv"]
         command = [
             str(compiler),
             diagnostic_limit,
