@@ -6630,6 +6630,12 @@ int4 RulePtrArith::applyOp(PcodeOp *op,Funcdata &data)
     if (ct->getMetatype() == TYPE_PTR) break;
   }
   if (slot == op->numInput()) return 0;
+  // An odd sized primitive (3, 5, 6, 7 bytes) steps by its padded size here but by its true
+  // size in C, so its pointer arithmetic stays in bytes.
+  const Datatype *pointee = ((const TypePointer *)ct)->getPtrTo();
+  if (pointee->getMetatype() != TYPE_STRUCT && pointee->getMetatype() != TYPE_ARRAY &&
+      pointee->getMetatype() != TYPE_UNION && pointee->getSize() != pointee->getAlignSize())
+    return 0;
   if (evaluatePointerExpression(op, slot) != 2) return 0;
   if (!verifyPreferredPointer(op, slot)) return 0;
 
