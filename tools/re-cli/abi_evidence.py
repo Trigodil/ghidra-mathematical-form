@@ -292,8 +292,15 @@ def seed_manifests(base, rows, imports=()):
                 and not row.get('unknown_relocation_read', True)
                 and row.get('bad_data') is False
                 and row.get('unimplemented_instructions') is False)
-        if functions[0]['stackargs'] and any(p['space'] == 'stack' for p in functions[0]['inputs']):
-            functions[0]['stackargs'] = None	# these words are already parameters
+        stack = [p for p in functions[0]['inputs'] if p['space'] == 'stack']
+        if functions[0]['stackargs'] and stack:
+            # A block that reads words past the stack parameters replaces them; else it adds nothing.
+            past = any(not any(p['offset'] <= f['offset'] and f['offset'] + f['size'] <= p['offset'] + p['size']
+                               for p in stack) for f in functions[0]['stackargs']['fields'])
+            if past:
+                functions[0]['inputs'] = [p for p in functions[0]['inputs'] if p['space'] != 'stack']
+            else:
+                functions[0]['stackargs'] = None	# these words are already parameters
         if functions[0]['stackargs'] and 'cold' in (row.get('name') or ''):
             functions[0]['stackargs'] = None	# parent frame words, not arguments
         if safe:

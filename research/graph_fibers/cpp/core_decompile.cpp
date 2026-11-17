@@ -475,12 +475,17 @@ static std::vector<StackArg> discoverStackArgs(ghidra::Funcdata &fd) {
     // A cold fragment runs in its parent's frame, so its stack words are not arguments.
     const std::string &name = fd.getName();
     if (name.find("cold") != std::string::npos) return found;
-    // Words the decompiler already made parameters are not left over.
+    // Stack parameters join the block only when the body also reads stack words past them.
     const auto &proto = fd.getFuncProto();
+    std::vector<StackArg> params;
     for (int i = 0; i < proto.numParams(); ++i) {
-        auto address = proto.getParam(i)->getAddress();
-        if (!address.isInvalid() && address.getSpace()->getType() == ghidra::IPTR_SPACEBASE) return found;
+        auto *param = proto.getParam(i);
+        auto address = param->getAddress();
+        if (address.isInvalid() || address.getSpace()->getType() != ghidra::IPTR_SPACEBASE) continue;
+        if (param->getSize() < 1 || param->getSize() > 16) return found;
+        params.push_back({address.getOffset(), param->getSize(), stackFieldType(param->getType())});
     }
+    bool leftover = false;
     for (auto it = fd.beginDef(ghidra::Varnode::input); it != fd.endDef(ghidra::Varnode::input); ++it) {
         auto *vn = *it;
         if (vn->getSpace()->getType() != ghidra::IPTR_SPACEBASE || vn->getOffset() < 8 ||
@@ -488,6 +493,14 @@ static std::vector<StackArg> discoverStackArgs(ghidra::Funcdata &fd) {
         if (vn->getSize() < 1 || vn->getSize() > 16) return {};
         std::string type = stackFieldType(vn->getType());
         found.push_back({vn->getOffset(), vn->getSize(), type});
+        bool covered = false;
+        for (const auto &p : params)
+            covered = covered || (vn->getOffset() >= p.offset && vn->getOffset() + vn->getSize() <= p.offset + p.size);
+        leftover = leftover || !covered;
+    }
+    if (!params.empty()) {
+        if (!leftover) return {};
+        found.insert(found.end(), params.begin(), params.end());
     }
     std::sort(found.begin(), found.end(), [](const StackArg &a, const StackArg &b) {
         return a.offset != b.offset ? a.offset < b.offset : a.size > b.size; });
@@ -821,7 +834,9 @@ static const std::unordered_map<std::string, std::string> &importSignatures() {
         {"pthread_mutex_destroy", "i p"}, {"pthread_cond_signal", "i p"},
         {"pthread_cond_broadcast", "i p"}, {"pthread_cond_destroy", "i p"},
         {"pthread_mutex_init", "i p p"}, {"pthread_cond_init", "i p p"},
-        {"pthread_cond_wait", "i p p"}, {"pthread_create", "i p p p p"}, {"pthread_join", "i z p"}};
+        {"pthread_cond_wait", "i p p"}, {"pthread_create", "i p p p p"}, {"pthread_join", "i z p"},
+        {"__assert_fail", "v s s u s"}, {"__fgets_chk", "s s z i p"}, {"__fread_chk", "z p z z z p"},
+        {"__memset_chk", "p p i z z"}, {"__sysv_signal", "p i p"}, {"utimensat", "i i s p i"}};
     return table;
 }
 
