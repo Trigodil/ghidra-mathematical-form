@@ -147,6 +147,32 @@ TOOLCHAIN_RUNTIME = {
 CLONE_NAME = re.compile(r'\b[A-Za-z_]\w*(?:\.(?:part|constprop|isra|cold|lto_priv|localalias|\d+))+(?!\w)')
 
 
+STORED_LITERAL = re.compile(r'(?<![=!<>])= ("(?:[^"\\\n]|\\.)*");')
+
+
+def pin_stored_literals(text, rip_path, image):
+    """A string literal stored as a pointer keeps the original object's identity (zstd uses
+    one as a window base), so it becomes the recovered string at the address the code loaded."""
+    if image is None or not STORED_LITERAL.search(text):
+        return text
+    try:
+        rows = [line.split('\t') for line in Path(rip_path).read_text().splitlines()[1:]]
+    except OSError:
+        return text
+    targets = sorted({int(r[1], 16) for r in rows if len(r) >= 3 and r[2] == 'address'})
+
+    def pin(match):
+        try:
+            wanted = match[1][1:-1].encode('latin-1').decode('unicode_escape').encode('latin-1') + b'\0'
+        except (UnicodeError, ValueError):
+            return match[0]
+        hits = [t for t in targets if image.read(t, len(wanted)) == wanted]
+        if len(hits) != 1:
+            return match[0]
+        return f'= (char *)__recovery_string_{hits[0]:x};'
+    return STORED_LITERAL.sub(pin, text)
+
+
 def code_mask(text):
     return NONCODE.sub(lambda m: ''.join('\n' if c == '\n' else ' ' for c in m[0]), text)
 
@@ -993,6 +1019,7 @@ def assemble(binary_report):
                 renames[word] = definitions[int(match[1],16)]
     transformed, slice_widths, odd_widths, storage, frames = [], set(), set(), [], []
     for address, text in bodies:
+        text = pin_stored_literals(text, base / 'functions' / f'{address:x}' / 'rip-references.tsv', image)
         lowered, vectors = lower_vectors(replace_identifiers(text, renames))
         lowered, used, detail = lower_storage(lowered)
         lowered = lower_struct_casts(lowered)

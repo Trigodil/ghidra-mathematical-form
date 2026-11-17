@@ -278,6 +278,8 @@ def recover(base, rows, functions=None, source="", image=None):
                   and r.get("initial_status") != "known" and r["size"] == 8}
         for words in relocated_arrays.values():
             wanted.update(t for _, t in words if t is not None and t not in functions)
+        # Literals the lowering pinned to their original address (pin_stored_literals).
+        wanted.update(int(m, 16) for m in re.findall(r"\b__recovery_string_([0-9a-f]+)\b", source))
         for target in sorted(wanted):
             if any(start <= target < end for start, end in extents):
                 continue
@@ -565,6 +567,17 @@ def recover(base, rows, functions=None, source="", image=None):
         ):
             declarations.append("extern " + declaration)
             external.append(name)
+    # A pinned literal inside a larger recovered object (a string table) is an address in it.
+    for target in sorted({int(m, 16) for m in re.findall(r"\b__recovery_string_([0-9a-f]+)\b", source)}):
+        name = f"__recovery_string_{target:x}"
+        if name in exported:
+            continue
+        holders = [r for r in records.values() if r["name"] in exported and r["name"] not in blocked
+                   and r["address"] <= target < r["address"] + r["size"]]
+        if holders:
+            holder = min(holders, key=lambda r: (r["size"], r["name"]))
+            declarations.append(f'#define {name} ((char *)&({holder["name"]}) + {target - holder["address"]})')
+            exported.append(name)
     # An object that starts where another ends: a pointer to it may be the other's end.
     past_end = {}
     for record in address_objects:
