@@ -1318,6 +1318,8 @@ void Merge::processHighDominantCopy(HighVariable *high)
 {
   vector<PcodeOp *> copyIns;
 
+  // A hoisted write to aliased memory could move above a STORE through a pointer to it
+  if (high->isAddrTied() && !high->getInstance(0)->hasNoLocalAlias()) return;
   findAllIntoCopies(high,copyIns,true);	// Get all COPYs into this with temporary output
   if (copyIns.size() < 2) return;
   int4 pos = 0;
