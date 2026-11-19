@@ -1814,6 +1814,10 @@ void Heritage::refineWrite(Varnode *vn,const Address &addr,const vector<int4> &r
   PcodeOp *def = vn->getDef();
   fd->opSetOutput(def,replacevn);
   splitPieces(newvn,def,vn->getAddr(),vn->getSize(),replacevn);
+  if (vn->isStackStore()) {	// A piece of a STORE is still a STORE (ActionDirectWrite needs it)
+    for(int4 i=0;i<newvn.size();++i)
+      newvn[i]->setStackStore();
+  }
   fd->totalReplace(vn,replacevn);
   fd->deleteVarnode(vn);
 }
