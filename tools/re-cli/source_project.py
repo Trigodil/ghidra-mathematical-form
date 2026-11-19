@@ -577,6 +577,10 @@ def lower_storage(text):
                     unresolved.append(match[0])
                     continue
                 value = lower(fragment[start:stop])
+                # A byte array value would decay to its address in the integer cast; load its bytes.
+                array = re.fullmatch(r'\s*\*\((?:xunknown1|uint1|int1) \(\*\) ?\[(\d+)\]\)(\(.*\))\s*', value, re.S)
+                if array and int(array[1]) == width and cast_operand_end(array[2], 0) == len(array[2]):
+                    value = f'__recovery_read{width}({array[2]}, 0)'
                 replacement = f'__recovery_SET{width}({name}, {offset}, ({value}))'
                 end = stop
             else:
