@@ -2031,17 +2031,19 @@ void ActionReturnRecovery::buildReturnOutput(ParamActive *active,PcodeOp *retop,
 }
 
 // True if vn is copied from a LOAD at a stack pointer offset (spill not heritaged yet)
-static bool isPendingStackLoad(const Varnode *vn,const Funcdata &data)
+static bool isPendingStackLoad(const Varnode *vn,const Funcdata &data,bool followMerge)
 
 {
   while(vn->isWritten() && vn->getDef()->code() == CPUI_COPY)
     vn = vn->getDef()->getIn(0);
   if (!vn->isWritten() || vn->getDef()->code() != CPUI_LOAD) return false;
   vn = vn->getDef()->getIn(1);
-  while(vn->isWritten()) {		// Follow the pointer back to the stack pointer
+  for(int4 steps=0;vn->isWritten();++steps) {	// Follow the pointer back to the stack pointer
     const PcodeOp *op = vn->getDef();
     OpCode opc = op->code();
     if (opc == CPUI_COPY)
+      vn = op->getIn(0);
+    else if (followMerge && opc == CPUI_MULTIEQUAL && steps < 256)	// Merged after calls; first slot only (hidden result pointer)
       vn = op->getIn(0);
     else if (opc == CPUI_INT_ADD && op->getIn(0)->isConstant())
       vn = op->getIn(1);
@@ -2083,7 +2085,7 @@ int4 ActionReturnRecovery::apply(Funcdata &data)
 	if (ancestorReal.execute(op,slot,&trial,false))
 	  if (data.ancestorOpUse(maxancestor,vn,op,trial,0,0))
 	    trial.markActive(); // This varnode sees active use as a parameter
-	if (!trial.isActive() && active->getNumPasses() == 0 && isPendingStackLoad(vn,data)) {
+	if (!trial.isActive() && active->getNumPasses() == 0 && isPendingStackLoad(vn,data,i == 0)) {
 	  active->setMaxPass(3);	// Wait for stack heritage to resolve the spill
 	  pending[i] = true;
 	  waiting = true;
