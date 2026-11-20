@@ -207,7 +207,7 @@ def override_definition(definition, entry, stats):
         if kind in 'PSU' and width in (1, 2, 4, 8):
             if len(slots) < 6:
                 slots.append(token)
-        elif kind == 'O' and width <= 16 or kind in 'PSU':
+        elif (kind == 'O' and width <= 16) or kind in 'PSU':
             complete = False
             break
     inputs = definition['inputs']
@@ -307,7 +307,6 @@ def seed_manifests(base, rows, imports=()):
             functions[0]['stackargs'] = None	# parent frame words, not arguments
         if safe:
             definitions[row['address']] = functions[0]
-        if safe:
             by_caller[row['address']] = [r['target'] for r in records if r['kind'] == 'call']
             for r in records:
                 out = r['output']
@@ -345,10 +344,12 @@ def seed_manifests(base, rows, imports=()):
         own = definitions.get(caller)
         # A function reading its own stack words is reanalyzed with them as a struct parameter.
         # A narrow result that callers read wider is reanalyzed with the wider width.
-        own_row = own and (own['stackargs'] or result_width(own, reads.get(caller))
-                           or caller in overridden)
-        wanted = sorted((set(targets) - {caller}) | ({caller} if own_row else set()))
-        for target in wanted:
+        reseed_self = own and (own['stackargs'] or result_width(own, reads.get(caller))
+                               or caller in overridden)
+        wanted = set(targets) - {caller}
+        if reseed_self:
+            wanted.add(caller)
+        for target in sorted(wanted):
             if target in imports:
                 rejected.append({'target': target, 'reason': 'library import'})
                 continue
@@ -360,14 +361,15 @@ def seed_manifests(base, rows, imports=()):
                 rejected.append({'target': target, 'reason': 'unsupported prototype model'})
                 continue
             parameters = [definition['output']] + definition['inputs']
-            if any(p is None or not 1 <= p['size'] <= 16 and p['type_descriptor'] == 'unsupported'
+            if any(p is None or (not 1 <= p['size'] <= 16 and p['type_descriptor'] == 'unsupported')
                    for p in parameters):
                 rejected.append({'target': target, 'reason': 'unsupported type'})
                 continue
             if any(p['space'] not in ('invalid', 'register', 'stack', 'join') for p in parameters):
                 rejected.append({'target': target, 'reason': 'unsupported storage'})
                 continue
-            if any((p['space'] == 'join') == (not p['pieces']) for p in parameters):
+            # Join storage must carry pieces, and only join storage may.
+            if any((p['space'] == 'join') != bool(p['pieces']) for p in parameters):
                 rejected.append({'target': target, 'reason': 'unsupported storage'})
                 continue
             fields = [f'{target:x}', definition['model']]
@@ -395,12 +397,12 @@ def seed_manifests(base, rows, imports=()):
     return result
 
 
-XMM_ARGUMENTS = {0x1200 + 0x40 * j for j in range(8)}
+XMM_ARGUMENTS = tuple(0x1200 + 0x40 * j for j in range(8))	# xmm0..xmm7
 
 
 def va_spill(definition):
     """gcc's va_start prologue reads all eight xmm argument registers; no caller passes them all."""
-    return XMM_ARGUMENTS <= {p['offset'] for p in definition['inputs'] if p['space'] == 'register'}
+    return set(XMM_ARGUMENTS) <= {p['offset'] for p in definition['inputs'] if p['space'] == 'register'}
 
 
 CTYPE_BY_META = {12: 'bool', 13: 'uint', 14: 'int', 15: 'xunknown', 10: 'float'}
@@ -410,10 +412,18 @@ def c_type(descriptor):
     """C spelling of a prototype type descriptor; unknown shapes become words of the same size."""
     if descriptor.startswith('p'):
         _, _, child = descriptor.partition('_')
-        return ('void' if child.startswith('b17_') else 'code' if child.startswith('c') else c_type(child)) + ' *'
+        if child.startswith('b17_'):
+            return 'void *'
+        if child.startswith('c'):
+            return 'code *'
+        return c_type(child) + ' *'
     meta, _, size = descriptor[1:].partition('_')
     name = CTYPE_BY_META.get(int(meta), 'xunknown')
-    return name if name == 'bool' else f'{name}{size}' if name != 'xunknown' or int(size) in (1, 2, 4, 8, 16) else 'xunknown1'
+    if name == 'bool':
+        return name
+    if name == 'xunknown' and int(size) not in (1, 2, 4, 8, 16):
+        return 'xunknown1'
+    return f'{name}{size}'
 
 
 def stack_struct_name(function_name):

@@ -43,7 +43,9 @@ public:
             Elf64_Shdr sh; std::memcpy(&sh,data.data()+h.e_shoff+i*sizeof(sh),sizeof(sh));
             if((sh.sh_flags&SHF_ALLOC) && sh.sh_size) sections.push_back({sh.sh_addr,sh.sh_size});
             if(sh.sh_type!=SHT_RELA && sh.sh_type!=SHT_REL && sh.sh_type!=SHT_RELR) continue;
-            size_t width=sh.sh_type==SHT_RELA ? sizeof(Elf64_Rela) : (sh.sh_type==SHT_REL ? sizeof(Elf64_Rel) : sizeof(uint64_t));
+            size_t width=sizeof(uint64_t);	// SHT_RELR bitmap words
+            if(sh.sh_type==SHT_RELA) width=sizeof(Elf64_Rela);
+            else if(sh.sh_type==SHT_REL) width=sizeof(Elf64_Rel);
             fibers::require(sh.sh_entsize==width && sh.sh_size%width==0 && sh.sh_offset<=data.size() && sh.sh_size<=data.size()-sh.sh_offset,"Invalid relocations");
             uint64_t cursor=0;
             for(uint64_t off=0;off<sh.sh_size;off+=width) {
@@ -129,9 +131,7 @@ public:
             if((p.p_flags&PF_W) || address<p.p_vaddr || address-p.p_vaddr>p.p_filesz ||
                p.p_filesz-(address-p.p_vaddr)<8) continue;
             uint8_t bytes[8];
-            bool before=unknownRelocationRead;
             loadFill(bytes,8,ghidra::Address(space,address));
-            if(unknownRelocationRead && !before) return false;
             if(unknownRelocationRead) return false;
             value=0; for(unsigned i=0;i<8;++i) value|=uint64_t(bytes[i])<<(8*i);
             return true;
@@ -328,7 +328,11 @@ public:
     bool isTarget(uint64_t value) const { return constants.count(value)!=0; }
     RipProvenance(MappedElfImage& img,const std::string& sla):image(img),sleigh(&window,&context) {
         std::string escaped;
-        for(char ch:sla) escaped+=ch=='&'?"&amp;":ch=='<'?"&lt;":std::string(1,ch);
+        for(char ch:sla) {
+            if(ch=='&') escaped+="&amp;";
+            else if(ch=='<') escaped+="&lt;";
+            else escaped+=ch;
+        }
         std::istringstream xml("<sleigh>"+escaped+"</sleigh>");
         auto *root=documents.parseDocument(xml)->getRoot();documents.registerTag(root);
         sleigh.initialize(documents);
@@ -670,7 +674,7 @@ static SeedStorage parseSeedStorage(ghidra::Architecture &arch, std::string fiel
 }
 
 static void applyPrototypeSeeds(StaticElfArchitecture &arch, ghidra::Scope *scope,
-                                uint64_t selected, const std::string &path,
+                                const std::string &path,
                                 const std::filesystem::path &output,
                                 const std::unordered_set<uint64_t> &imports) {
     std::ifstream input(path);
@@ -771,7 +775,7 @@ static void applyPrototypeSeeds(StaticElfArchitecture &arch, ghidra::Scope *scop
                 const uint64_t offset = address.isInvalid() ? 0 : address.getOffset();
                 // Join offsets are per-run ids, so joins compare by their ordered pieces.
                 const bool join = space == "join" && expected[i].space == "join";
-                if (join ? joinPieces(address) != expected[i].pieces : false)
+                if (join && joinPieces(address) != expected[i].pieces)
                     throw std::runtime_error("ABI storage mismatch");
                 if (space != expected[i].space || (!join && offset != expected[i].offset) ||
                     assigned[i].type->getSize() != expected[i].size || assigned[i].flags != 0)
@@ -967,14 +971,13 @@ int main(int argc,char **argv) {
             scope->addFunction(selected,name.str());
         }
         std::filesystem::create_directories(argv[4]);
-        if (argc == 6) applyPrototypeSeeds(arch, scope, selectedAddress, argv[5], argv[4], imports);
+        if (argc == 6) applyPrototypeSeeds(arch, scope, argv[5], argv[4], imports);
         auto fd=scope->queryFunction(selected);
         fibers::require(fd!=nullptr,"Cannot create selected function");
         auto action=arch.allacts.getCurrent();auto peel=action->getSubRule("peel_multi_region");
         fibers::require(peel!=nullptr,"Updated peel_multi_region pass is absent from the action pool");
         action->reset(*fd);int result=action->perform(*fd);
         fibers::require(result>=0,"Decompilation stopped before completion");
-        std::filesystem::create_directories(argv[4]);
         std::ostringstream functionText;arch.print->setOutputStream(&functionText);arch.print->docFunction(fd);
         std::ofstream out(std::filesystem::path(argv[4])/"decompiled.c");out<<functionText.str();out.flush();
         fibers::require(bool(out),"Cannot save pseudocode");
@@ -1002,20 +1005,24 @@ int main(int argc,char **argv) {
         // Operands computed from the instruction pointer, with the decoder's own account of them.
         std::ofstream rip(std::filesystem::path(argv[4])/"rip-references.tsv");
         rip << "site\ttarget\tkind\tregion\n";
-        for(const auto& reference:arch.provenance->references)
+        for(const auto& reference:arch.provenance->references) {
+            const char* region="other";
+            if(image->executableAddress(reference.target)) region="code";
+            else if(image->dataRange(reference.target,1)) region="data";
             rip << std::hex << reference.site << "\t" << reference.target << "\t"
-                << (reference.constant?"address":"memory") << "\t"
-                << (image->executableAddress(reference.target)?"code":image->dataRange(reference.target,1)?"data":"other") << "\n";
+                << (reference.constant?"address":"memory") << "\t" << region << "\n";
+        }
         rip.close(); fibers::require(bool(rip),"Cannot save RIP references");
         std::ofstream edges(std::filesystem::path(argv[4])/"recovered-edges.tsv");
         edges << "kind\tsite\ttarget\n";
         for(int i=0;i<fd->numCalls();++i) {
             auto call=fd->getCallSpecs(i); auto op=call->getOp();
+            if(!op) continue;
             auto target=call->getEntryAddress();
-            if(op && (target.isInvalid() || target.getSpace()!=arch.getDefaultCodeSpace()) &&
+            if((target.isInvalid() || target.getSpace()!=arch.getDefaultCodeSpace()) &&
                op->code()==ghidra::CPUI_CALLIND && op->numInput()>0 && op->getIn(0)->isConstant())
                 target=ghidra::Address(arch.getDefaultCodeSpace(),op->getIn(0)->getOffset());
-            if(op && target.isInvalid() && op->code()==ghidra::CPUI_CALLIND && op->numInput()>0) {
+            if(target.isInvalid() && op->code()==ghidra::CPUI_CALLIND && op->numInput()>0) {
                 auto value=op->getIn(0); auto def=value->getDef();
                 uint64_t directPointer;
                 if(value->getSize()==8 && value->getSpace()==arch.getDefaultDataSpace() &&
@@ -1028,7 +1035,7 @@ int main(int argc,char **argv) {
                         target=ghidra::Address(arch.getDefaultCodeSpace(),pointer);
                 }
             }
-            if(op && !target.isInvalid() && target.getSpace()==arch.getDefaultCodeSpace() &&
+            if(!target.isInvalid() && target.getSpace()==arch.getDefaultCodeSpace() &&
                image->executableAddress(target.getOffset()))
                 edges << (op->code()==ghidra::CPUI_CALLIND ? "indirect_call\t" : "call\t") << std::hex << op->getAddr().getOffset() << "\t" << target.getOffset() << "\n";
         }

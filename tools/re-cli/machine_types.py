@@ -269,10 +269,11 @@ def operand(toks, at, step):
     depth, k = 0, at + step
     while 0 <= k < len(toks):
         tok = toks[k][2]
+        # Walking backward, a closing bracket opens a group.
         if tok in ('(', '['):
-            depth += step == 1 and 1 or -1
+            depth += step
         elif tok in (')', ']'):
-            depth += step == -1 and 1 or -1
+            depth -= step
         if depth < 0:
             break
         if depth == 0 and tok in STOP:

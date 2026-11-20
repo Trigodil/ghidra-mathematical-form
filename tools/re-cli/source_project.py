@@ -18,11 +18,9 @@ ADDRESS_CALL = re.compile(r'\b(?:func_0x|__recovered_)([0-9a-fA-F]{1,16})\s*\(')
 WIDTHS = (1, 2, 4, 8, 16)
 ODD_TYPE = re.compile(r'unk(?:u?int|byte)\d+')
 # Imports and p-code user operations have no body in the image; declare, never define.
-# Variadic form keeps calls whose arguments the decompiler dropped well formed.
 USEROPS = {
     # UD2 raises SIGILL; the userop never returns a target.
     'invalidInstructionException': 'static inline code *invalidInstructionException(void) { __builtin_trap(); }',
-    **{name: f'extern void {name}(...);' for name in ('abort', 'exit', '__assert_fail', '__stack_chk_fail')},
     # FLOAT_NAN; the decompiler prints the op as NAN(x).
     'NAN': '#define NAN(x) __builtin_isnan(x)',
     # A string store of exactly n bytes: the literal, then zeros (its bytes may hold a NUL).
@@ -140,10 +138,10 @@ def import_decl(name, text=''):
 
 
 USEROPS.update({name: import_decl(name) for name in ('abort', 'exit', '__assert_fail', '__stack_chk_fail')})
-# Defined by the hosted C start files (Scrt1.o, crti.o, crtbeginS.o, crtn.o), which
-# the compiler driver links again; emitting them would define them twice.
 PLT_SECTIONS = {'.plt', '.plt.sec', '.plt.got'}
 GOT_CALL = re.compile(r'\(\*[A-Za-z_]*Ram([0-9a-fA-F]{16})\)')
+# Defined by the hosted C start files (Scrt1.o, crti.o, crtbeginS.o, crtn.o), which
+# the compiler driver links again; emitting them would define them twice.
 TOOLCHAIN_RUNTIME = {
     '_start', '_init', '_fini', '_dl_relocate_static_pie', '__libc_csu_init',
     '__libc_csu_fini', 'deregister_tm_clones', 'register_tm_clones',
@@ -179,15 +177,17 @@ def pin_stored_literals(text, rip_path, image):
 
 
 # Integer argument registers in call order: rdi rsi rdx rcx r8 r9 (register space offsets).
-ARG_REGISTERS = (0x38, 0x30, 0x10, 0x8, 0x80, 0x88)
+ARG_REGISTERS = abi_evidence.INT_REGISTERS
 
 
 def lower_variadic(text, evidence_path):
     """gcc's va_start prologue spills r8, r9 and xmm0-7 and takes the stack argument address, so the
     decompiled definition has them as inputs. Make it variadic and read them from its own va_list."""
     parsed = signature(text) if re.search(r'\bin_AL\b', text) else None
+    if not parsed:
+        return text
     try:
-        records = abi_evidence.read_evidence(evidence_path) if parsed else []
+        records = abi_evidence.read_evidence(evidence_path)
     except (OSError, ValueError):
         return text
     record = next((r for r in records if r['kind'] == 'function'), None)
@@ -195,7 +195,7 @@ def lower_variadic(text, evidence_path):
         return text
     params = [p.strip() for p in parsed[1][parsed[1].index('(') + 1:parsed[1].rindex(')')].split(',')]
     inputs = sorted(record['inputs'], key=lambda p: p['index'])
-    xmm = {0x1200 + 0x40 * j: j for j in range(8)}
+    xmm = abi_evidence.XMM_ARGUMENTS
     if len(params) != len(inputs) or not abi_evidence.va_spill(record):
         return text
     # The hand-built va_list stores gp_offset (8 per named register) next to fp_offset 0x30.
@@ -211,7 +211,7 @@ def lower_variadic(text, evidence_path):
         if row['space'] == 'stack':
             where = f'overflow_arg_area + {row["offset"] - 8}'
         elif row['offset'] in xmm:
-            where = f'reg_save_area + {0x30 + 16 * xmm[row["offset"]]}'
+            where = f'reg_save_area + {0x30 + 16 * xmm.index(row["offset"])}'
         elif row['offset'] in ARG_REGISTERS[named:]:
             where = f'reg_save_area + {8 * ARG_REGISTERS.index(row["offset"])}'
         elif row['offset'] in ARG_REGISTERS:
@@ -401,7 +401,7 @@ def lower_small_array_copies(text):
         left, right = text[m.start(2):m.end(2)], text[m.start(3):m.end(3)].strip()
         dst, src = array_lvalue(left), array_lvalue(right)
         # lower_vectors handles 16 byte arrays.
-        if dst and dst[0] == 16 or src and src[0] == 16:
+        if (dst and dst[0] == 16) or (src and src[0] == 16):
             continue
         piece = re.search(r'\._\d+_(\d+)_\s*$', left)
         if piece and src:
@@ -489,15 +489,30 @@ def lower_vectors(text):
         zero = re.compile(r'\(\s*' + VECTOR_ELEMENT + r'\s*\[\s*(\d+)\s*\]\s*\)\s*0x0\s*')
         # Buffer to buffer is a plain byte copy; the array cannot initialize a compound literal.
         width = int(match[2]) if odd_slot(match) else None
-        bound = (lambda n: f'(sizeof({n}) < {width} ? sizeof({n}) : {width})') if width else (lambda n: f'sizeof({n})')
-        copies = [(m.start(), m.end(), f'__builtin_memset({match[1]}, 0, {width or zero.fullmatch(m[1])[1]});' if zero.fullmatch(m[1])
-                   else f'__builtin_memcpy({match[1]}, {m[1].strip()}, {bound(m[1].strip())});' if m[1].strip() in buffer_names
-                   else '__builtin_memcpy({0}, &(__typeof__({1})){{{1}}}, {2});'.format(
-                       match[1], lowered(m.start(1), m.end(1)), bound(lowered(m.start(1), m.end(1)))))
+
+        def bound(n):
+            return f'(sizeof({n}) < {width} ? sizeof({n}) : {width})' if width else f'sizeof({n})'
+
+        def copy_into(m):
+            # buffer = value: zero fill, buffer to buffer, or a word through a compound literal.
+            value = m[1].strip()
+            if zero.fullmatch(m[1]):
+                return f'__builtin_memset({match[1]}, 0, {width or zero.fullmatch(m[1])[1]});'
+            if value in buffer_names:
+                return f'__builtin_memcpy({match[1]}, {value}, {bound(value)});'
+            source = lowered(m.start(1), m.end(1))
+            return '__builtin_memcpy({0}, &(__typeof__({1})){{{1}}}, {2});'.format(match[1], source, bound(source))
+
+        def copy_out(m):
+            # word = buffer: an odd slot fills the word's other bytes with zeros first.
+            if width:
+                return (f'(__builtin_memset(&({m[1]}), 0, sizeof({m[1]})), '
+                        f'__builtin_memcpy(&({m[1]}), {match[1]}, {bound(m[1])}));')
+            return f'__builtin_memcpy(&({m[1]}), {match[1]}, sizeof({m[1]}));'
+
+        copies = [(m.start(), m.end(), copy_into(m))
                   for m in re.finditer(rf'(?m)^[ \t]*{name}[ \t]*=(?!=)[ \t]*([^;{{}}]+);', masked)]
-        copies += [(m.start(), m.end(), f'(__builtin_memset(&({m[1]}), 0, sizeof({m[1]})), '
-                    f'__builtin_memcpy(&({m[1]}), {match[1]}, {bound(m[1])}));' if width else
-                    f'__builtin_memcpy(&({m[1]}), {match[1]}, sizeof({m[1]}));')
+        copies += [(m.start(), m.end(), copy_out(m))
                    for m in re.finditer(rf'(?m)^[ \t]*([A-Za-z_]\w*)[ \t]*=[ \t]*{name};', masked)
                    if m[1] not in buffer_names]
         if copies and width:
@@ -647,7 +662,7 @@ def lower_storage(text):
             if match.start() < cursor:
                 continue
             name, offset, width = match[1], int(match[2]), int(match[3])
-            if width > 16 and width <= 4096:
+            if 16 < width <= 4096:
                 # Pieces wider than a word are byte ranges of the object, copied or viewed in place.
                 after = mask[match.end():].lstrip()
                 before = mask[:match.start()].rstrip()
@@ -680,7 +695,9 @@ def lower_storage(text):
             after = mask[match.end():].lstrip()
             before = mask[:match.start()].rstrip()
             write = after.startswith('=') and not after.startswith('==')
-            if after.startswith(('++','--','+=','-=','*=','/=','%=', '&=', '|=', '^=', '<<=', '>>=')) or before.endswith(('++','--')) or re.search(r'(?<!&)&$', before) and not re.search(r'[\w)\]]\s*&$', before):
+            updated = after.startswith(('++','--','+=','-=','*=','/=','%=', '&=', '|=', '^=', '<<=', '>>=')) or before.endswith(('++','--'))
+            address_taken = re.search(r'(?<!&)&$', before) and not re.search(r'[\w)\]]\s*&$', before)
+            if updated or address_taken:
                 unresolved.append(match[0])
                 continue
             end = match.end()
@@ -691,15 +708,7 @@ def lower_storage(text):
                     unresolved.append(match[0])
                     continue
                 start = end + len(mask[end:]) - len(mask[end:].lstrip()) + 1
-                depth = 0
-                stop = None
-                for position in range(start, len(mask)):
-                    ch = mask[position]
-                    if depth == 0 and ch in ';,)':
-                        stop = position
-                        break
-                    if ch in '([{': depth += 1
-                    elif ch in ')]}': depth -= 1
+                stop = statement_end(mask, start)
                 if stop is None:
                     unresolved.append(match[0])
                     continue
@@ -733,7 +742,6 @@ def lower_storage(text):
         lowered = (lowered[:decl.start()] + f'{decl[1]}struct {{ {scalar} value__; {pad}}} {name}__w;' +
                    lowered[decl.end():])
         mask = code_mask(lowered)
-        mask = code_mask(lowered)
         pieces, cursor = [], 0
         for use in re.finditer(rf'(?<![\w.>]){name}\b', mask):
             pieces.extend([lowered[cursor:use.start()], f'{name}__w.value__'])
@@ -765,12 +773,12 @@ def array_pointer_edits(source, mask, name, width, signed):
                 head = before[:index].rstrip()
                 inner = before[index + 1:-1]
                 # Only an integer cast keeps the dereference a value.
-                if not re.fullmatch(r'[\w\s]+', inner) or re.search(r'\w$', head) and not re.search(r'\b(?:return|else|case|do)$', head):
+                if not re.fullmatch(r'[\w\s]+', inner) or (re.search(r'\w$', head) and not re.search(r'\b(?:return|else|case|do)$', head)):
                     continue
             else:
                 continue
-        elif before.endswith('&') or before.endswith(('(', ',')) and re.search(r'\w\s*\($|,$', before) and \
-                _is_call_argument(before):
+        elif before.endswith('&') or (before.endswith(('(', ',')) and re.search(r'\w\s*\($|,$', before) and
+                                      _is_call_argument(before)):
             continue
         store = tail.startswith('=') and not tail.startswith('==')
         if tail.startswith(('++', '--')) or re.match(r'[-+*/%&|^]=|<<=|>>=', tail):
@@ -959,8 +967,14 @@ def lower_frame(text):
             if base is None:
                 return text, dict(reason='unsized_local')
             size = base + int(m['pad'] or 0) if widened else base * int(m['count'] or 1)
+            if 'int128' in m['type']:
+                align = 16
+            elif base < 16:
+                align = min(base, 8)
+            else:
+                align = 1
             fields.append(dict(span=(m.start(), m.end()), name=m['name'], offset=int(m['off'], 16),
-                               size=size, align=16 if 'int128' in m['type'] else min(base, 8) if base < 16 else 1, text=text[m.start():m.end()].strip(),
+                               size=size, align=align, text=text[m.start():m.end()].strip(),
                                array=bool(not widened and m['count'])))
     if not fields:
         return text, None
@@ -1188,7 +1202,7 @@ def assemble(binary_report):
         transformed = [code_blobs.rewrite(t, blob_labels) for t in transformed]
         source = '\n'.join(transformed)
     tokens = set(WORD.findall(code_mask(source)))
-    required = sorted(t for t in tokens if re.fullmatch(r'(?:CONCAT|SUB|SEXT|ZEXT|CARRY|SCARRY|SBORROW)\d+|POPCOUNT|LZCOUNT|BITCAST_\w+', t))
+    required = sorted(t for t in tokens if HELPER_CALLEE.fullmatch(t))
     implementations, unsupported = [], []
     for name in required:
         implementation = helper(name)

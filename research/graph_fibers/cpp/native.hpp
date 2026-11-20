@@ -540,7 +540,11 @@ inline z3::expr compute(const RawOp &op, const std::vector<z3::expr> &args) {
     case CPUI_INT_RIGHT:
     case CPUI_INT_SRIGHT: {
         auto bw = b.get_sort().bv_size();
-        auto count = bw < aw ? z3::zext(b, aw - bw) : bw > aw ? b.extract(aw - 1, 0) : b;
+        z3::expr count = b;    // shift count widened or cut to the value width
+        if (bw < aw)
+            count = z3::zext(b, aw - bw);
+        else if (bw > aw)
+            count = b.extract(aw - 1, 0);
         auto value = op.opcode == CPUI_INT_LEFT    ? z3::shl(a, count)
                      : op.opcode == CPUI_INT_RIGHT ? z3::lshr(a, count)
                                                    : z3::ashr(a, count);

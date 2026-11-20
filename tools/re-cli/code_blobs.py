@@ -50,7 +50,7 @@ def check(binary, start, end):
         mnemonic = text.split()[0] if text.split() else ''
         if '(bad)' in text or '%rip' in text:
             return f'rip relative or bad operand at {address:x}'
-        if mnemonic.startswith(('call', 'syscall')) or '*' in text and mnemonic.startswith('j'):
+        if mnemonic.startswith(('call', 'syscall')) or ('*' in text and mnemonic.startswith('j')):
             return f'call or indirect jump at {address:x}'
         if mnemonic.startswith(('j', 'loop')):
             target = re.match(r'\S+\s+([0-9a-f]+)\b', text)

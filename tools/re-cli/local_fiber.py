@@ -75,8 +75,13 @@ def target_fields(rows, function):
         operand = text[len(mnemonic):].strip()
         branch = BRANCH_TARGET.match(operand) if re.match(r"(?:j|call|loop|xbegin)", mnemonic) else None
         comment = RIP_COMMENT.search(text)
-        destination = int(branch[1], 16) if branch else int(comment[1], 16) if comment else None
-        if destination is None or start <= destination < end:
+        if branch:
+            destination = int(branch[1], 16)
+        elif comment:
+            destination = int(comment[1], 16)
+        else:
+            continue
+        if start <= destination < end:
             continue
         for width in ((4, 1) if branch else (4,)):
             expected = (destination - following).to_bytes(8, "little", signed=True)[:width]

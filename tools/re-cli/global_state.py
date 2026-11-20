@@ -52,13 +52,12 @@ def declaration_shape(record):
         return None
     qualifier, ctype, pointer, count = match.groups()
     count = int(count) if count else None
-    width = (
-        8
-        if pointer
-        else INTEGER_TYPES.get(
-            ctype, FLOAT_TYPES.get(ctype, 1 if ctype == "bool" else None)
-        )
-    )
+    if pointer:
+        width = 8
+    elif ctype == "bool":
+        width = 1
+    else:
+        width = INTEGER_TYPES.get(ctype, FLOAT_TYPES.get(ctype))
     if width is None or count == 0 or (count or 1) * width != record["size"]:
         return None
     return dict(
@@ -229,17 +228,16 @@ def recover(base, rows, functions=None, source="", image=None):
                         k: v for k, v in record.items() if k not in ignored
                     }
                     targets = (previous.get("pointer_target"), target)
+                    # Two known targets must agree, including whether they are code.
                     compatible = (
                         targets[0] is None
                         or targets[1] is None
-                        or targets[0] == targets[1]
-                    )
-                    if targets[0] is not None and targets[1] is not None:
-                        compatible = (
-                            compatible
+                        or (
+                            targets[0] == targets[1]
                             and previous["pointer_target_is_code"]
                             == record["pointer_target_is_code"]
                         )
+                    )
                     if not same or not compatible:
                         if not previous.get("conflict"):
                             obligations.append(
@@ -251,7 +249,7 @@ def recover(base, rows, functions=None, source="", image=None):
                         previous["pointer_target_is_code"] = record[
                             "pointer_target_is_code"
                         ]
-                elif previous is None:
+                else:
                     consumed += size
                     if consumed > MAX_TOTAL:
                         obligations.append(dict(name=name, reason="global_byte_budget"))
@@ -324,11 +322,10 @@ def recover(base, rows, functions=None, source="", image=None):
             relocated[name] = record["pointer_target"]
             reason = None
             value = ""
-        if reason is None:
-            if name not in relocated:
-                value, reason = initializer(
-                    record, shape, literal_pointer(record, extents)
-                )
+        if reason is None and name not in relocated:
+            value, reason = initializer(
+                record, shape, literal_pointer(record, extents)
+            )
         if reason:
             blocked.add(name)
             obligations.append(
@@ -524,14 +521,14 @@ def recover(base, rows, functions=None, source="", image=None):
                 other for other in address_objects
                 if other["name"] not in blocked and other["address"] <= target < other["address"] + other["size"]
             ]
+            past = [o for o in address_objects if o["address"] + o["size"] == target and o["name"] not in blocked]
             if possible:
                 other = min(possible, key=lambda r: (r["size"], r["name"]))
                 values.append(f'(unsigned long)((unsigned char *)&{other["name"]} + {target - other["address"]})')
             elif functions.get(target):
                 values.append(f"(unsigned long)&{functions[target]}")
-            elif any(o["address"] + o["size"] == target and o["name"] not in blocked for o in address_objects):
-                other = min((o for o in address_objects if o["address"] + o["size"] == target and o["name"] not in blocked),
-                            key=lambda r: (r["size"], r["name"]))
+            elif past:
+                other = min(past, key=lambda r: (r["size"], r["name"]))
                 values.append(f'(unsigned long)((unsigned char *)&{other["name"]} + {other["size"]})')
             else:
                 values = None

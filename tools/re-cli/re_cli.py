@@ -520,8 +520,12 @@ class Workflow:
                 max_candidates=self.args.recovery_candidates)
             result['full_recovery']['missing_decompiler_functions'] = missing
         result['whole_binary_recovered'] = result['full_recovery']['whole_binary_recovered']
-        result['status'] = ('ok' if result['whole_binary_recovered'] else
-                            'failed' if result['analysis_status'] == 'failed' else 'partial')
+        if result['whole_binary_recovered']:
+            result['status'] = 'ok'
+        elif result['analysis_status'] == 'failed':
+            result['status'] = 'failed'
+        else:
+            result['status'] = 'partial'
         emit(f'[full recovery] {source.name}: {result["full_recovery"]["status"]}')
         save(Path(result['output']) / 'report.json', result)
         return result
@@ -737,9 +741,9 @@ class Workflow:
                     row['unknown_relocation_read'] = flags.get('unknown_relocation_read') != '0'
                     row['unimplemented_instructions'] = flags.get('unimplemented') != '0'
                     row['bad_data'] = flags.get('bad_data') != '0'
-                    if flags.get('unimplemented') == '1' or flags.get('bad_data') == '1' or row['warnings']:
-                        if row['status'] == 'ok':
-                            row['status'] = 'partial'
+                    flagged = flags.get('unimplemented') == '1' or flags.get('bad_data') == '1' or row['warnings']
+                    if flagged and row['status'] == 'ok':
+                        row['status'] = 'partial'
                 state['refreshed_functions' if refreshing else 'new_functions'] += 1
             if not refreshing:
                 rows.append(row)

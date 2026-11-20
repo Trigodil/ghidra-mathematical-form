@@ -482,9 +482,9 @@ void PrintC::opTypeCast(const PcodeOp *op)
     Datatype *src = op->getIn(0)->getHighTypeReadFacing(op);
     type_metatype outMeta = dt->getMetatype();
     type_metatype inMeta = src->getMetatype();
-    if (op->code() == CPUI_CAST &&
-	(outMeta == TYPE_FLOAT) != (inMeta == TYPE_FLOAT) && outMeta != TYPE_PTR &&
-	(inMeta != TYPE_PTR || outMeta == TYPE_FLOAT) &&
+    bool toFloat = (outMeta == TYPE_FLOAT && inMeta != TYPE_FLOAT);
+    bool fromFloat = (inMeta == TYPE_FLOAT && outMeta != TYPE_FLOAT && outMeta != TYPE_PTR);
+    if (op->code() == CPUI_CAST && (toFloat || fromFloat) &&
 	dt->getSize() == src->getSize() && dt->getSize() >= 4) {
       pushOp(&function_call,op);
       pushAtom(Atom("BITCAST_" + dt->getName(),optoken,EmitMarkup::no_color,op));
