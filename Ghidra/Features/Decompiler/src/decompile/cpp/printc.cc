@@ -478,11 +478,13 @@ void PrintC::opTypeCast(const PcodeOp *op)
   if (!option_nocasts) {
     // A CAST between float and non-float of one size keeps the bits; C would convert the value.
     // Only a CAST op moves bits; FLOAT_TRUNC and friends also print here and convert.
+    // A pointer read as a float is a bit copy too (C has no such conversion).
     Datatype *src = op->getIn(0)->getHighTypeReadFacing(op);
     type_metatype outMeta = dt->getMetatype();
     type_metatype inMeta = src->getMetatype();
     if (op->code() == CPUI_CAST &&
-	(outMeta == TYPE_FLOAT) != (inMeta == TYPE_FLOAT) && outMeta != TYPE_PTR && inMeta != TYPE_PTR &&
+	(outMeta == TYPE_FLOAT) != (inMeta == TYPE_FLOAT) && outMeta != TYPE_PTR &&
+	(inMeta != TYPE_PTR || outMeta == TYPE_FLOAT) &&
 	dt->getSize() == src->getSize() && dt->getSize() >= 4) {
       pushOp(&function_call,op);
       pushAtom(Atom("BITCAST_" + dt->getName(),optoken,EmitMarkup::no_color,op));
