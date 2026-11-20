@@ -301,6 +301,8 @@ def seed_manifests(base, rows, imports=()):
                 functions[0]['inputs'] = [p for p in functions[0]['inputs'] if p['space'] != 'stack']
             else:
                 functions[0]['stackargs'] = None	# these words are already parameters
+        if va_spill(functions[0]):
+            functions[0]['variadic'] = True
         if functions[0]['stackargs'] and 'cold' in (row.get('name') or ''):
             functions[0]['stackargs'] = None	# parent frame words, not arguments
         if safe:
@@ -391,6 +393,14 @@ def seed_manifests(base, rows, imports=()):
         result[caller] = ('\n'.join(lines) + ('\n' if lines else ''),
                           {'candidate_targets': accepted, 'rejected': rejected})
     return result
+
+
+XMM_ARGUMENTS = {0x1200 + 0x40 * j for j in range(8)}
+
+
+def va_spill(definition):
+    """gcc's va_start prologue reads all eight xmm argument registers; no caller passes them all."""
+    return XMM_ARGUMENTS <= {p['offset'] for p in definition['inputs'] if p['space'] == 'register'}
 
 
 CTYPE_BY_META = {12: 'bool', 13: 'uint', 14: 'int', 15: 'xunknown', 10: 'float'}

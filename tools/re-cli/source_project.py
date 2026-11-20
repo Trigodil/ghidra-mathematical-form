@@ -173,6 +173,62 @@ def pin_stored_literals(text, rip_path, image):
     return STORED_LITERAL.sub(pin, text)
 
 
+# Integer argument registers in call order: rdi rsi rdx rcx r8 r9 (register space offsets).
+ARG_REGISTERS = (0x38, 0x30, 0x10, 0x8, 0x80, 0x88)
+
+
+def lower_variadic(text, evidence_path):
+    """gcc's va_start prologue spills r8, r9 and xmm0-7 and takes the stack argument address, so the
+    decompiled definition has them as inputs. Make it variadic and read them from its own va_list."""
+    parsed = signature(text) if re.search(r'\bin_AL\b', text) else None
+    try:
+        records = abi_evidence.read_evidence(evidence_path) if parsed else []
+    except (OSError, ValueError):
+        return text
+    record = next((r for r in records if r['kind'] == 'function'), None)
+    if record is None:
+        return text
+    params = [p.strip() for p in parsed[1][parsed[1].index('(') + 1:parsed[1].rindex(')')].split(',')]
+    inputs = sorted(record['inputs'], key=lambda p: p['index'])
+    xmm = {0x1200 + 0x40 * j: j for j in range(8)}
+    if len(params) != len(inputs) or not abi_evidence.va_spill(record):
+        return text
+    # The hand-built va_list stores gp_offset (8 per named register) next to fp_offset 0x30.
+    masked = code_mask(text)
+    stores = {int(m[1], 16): int(m[2], 0) for m in re.finditer(r'Stack_([0-9a-f]+) = (0x[0-9a-f]+|\d+);', masked)}
+    named = next((v // 8 for k, v in stores.items() if v in range(8, 49, 8) and stores.get(k - 4) == 0x30), 0)
+    if not named:
+        return text
+    keep, macros = {}, []
+    for param, row in zip(params, inputs):
+        name = re.search(r'(\w+)\s*$', param)[1]
+        kind = param[:-len(name)].strip()
+        if row['space'] == 'stack':
+            where = f'overflow_arg_area + {row["offset"] - 8}'
+        elif row['offset'] in xmm:
+            where = f'reg_save_area + {0x30 + 16 * xmm[row["offset"]]}'
+        elif row['offset'] in ARG_REGISTERS[named:]:
+            where = f'reg_save_area + {8 * ARG_REGISTERS.index(row["offset"])}'
+        elif row['offset'] in ARG_REGISTERS:
+            keep[ARG_REGISTERS.index(row['offset'])] = param
+            continue
+        else:
+            return text
+        macros.append((name, f'(*({kind} *)((char *)va__[0].{where}))'))
+    if sorted(keep) != list(range(named)):
+        return text
+    head = parsed[1][:parsed[1].index('(')] + '(' + ','.join(keep[i] for i in range(named)) + ',...)'
+    last = re.search(r'(\w+)\s*$', keep[named - 1])[1]
+    body = text[masked.find('{') + 1:]
+    # Without the caller's al the xmm slots are always copied; unused ones are never read.
+    body = re.sub(r'(\bchar\s+in_AL)\s*;', r'\1 = 1;', body, count=1)
+    define = ''.join(f'#define {n} {v}\n' for n, v in macros)
+    undef = ''.join(f'#undef {n}\n' for n, _ in macros)
+    # The va_list escapes, so gcc's stdarg pass keeps the whole register save area.
+    return (f'{head}\n{{\n{define}  __builtin_va_list va__;\n  __builtin_va_start(va__, {last});\n'
+            f'  __asm__ volatile("" : : "r"(va__) : "memory");{body}\n{undef}')
+
+
 def code_mask(text):
     return NONCODE.sub(lambda m: ''.join('\n' if c == '\n' else ' ' for c in m[0]), text)
 
@@ -1000,6 +1056,7 @@ def assemble(binary_report):
             missing.append(row['address'])
             continue
         text, used = call_imports(clone_identifiers(path.read_text(errors='replace')), imports)
+        text = lower_variadic(text, path.parent / 'prototype-evidence.tsv')
         called_imports.update(used)
         parsed = signature(text)
         if parsed:
