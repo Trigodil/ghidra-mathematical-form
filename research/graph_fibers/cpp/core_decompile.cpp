@@ -131,8 +131,11 @@ public:
             if((p.p_flags&PF_W) || address<p.p_vaddr || address-p.p_vaddr>p.p_filesz ||
                p.p_filesz-(address-p.p_vaddr)<8) continue;
             uint8_t bytes[8];
+            // Probe alone, then merge: the function level flag stays sticky.
+            bool saved=unknownRelocationRead;unknownRelocationRead=false;
             loadFill(bytes,8,ghidra::Address(space,address));
-            if(unknownRelocationRead) return false;
+            bool unknown=unknownRelocationRead;unknownRelocationRead|=saved;
+            if(unknown) return false;
             value=0; for(unsigned i=0;i<8;++i) value|=uint64_t(bytes[i])<<(8*i);
             return true;
         }
