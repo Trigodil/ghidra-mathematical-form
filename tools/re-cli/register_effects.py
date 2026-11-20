@@ -99,3 +99,42 @@ def kept(base, rows, imports=()):
                 writes[start] = union
                 changed = True
     return {start: sorted(every - found) for start, found in writes.items() if every - found}
+
+
+STORE_WIDTH = {'movups': 16, 'movaps': 16, 'movdqu': 16, 'movdqa': 16, 'movq': 8, 'movsd': 8, 'movss': 4,
+               'movl': 4, 'movw': 2, 'movb': 1}
+REGISTER_WIDTH = ((re.compile(r'^%r(?:[a-ds]x|[sd]i|[bs]p|\d+)$'), 8), (re.compile(r'^%(?:e[a-ds]x|e[sd]i|e[bs]p|r\d+d)$'), 4),
+                  (re.compile(r'^%(?:[a-ds]x|[sd]i|r\d+w)$'), 2), (re.compile(r'^%(?:[a-d]l|[sd]il|r\d+b)$'), 1))
+
+
+def outgoing_extents(base):
+    """Map callee address to the stack argument block every direct caller writes from (%rsp) up, contiguously,
+    just before the call (the smallest over its call sites)."""
+    listing = parse(Path(base) / 'assembly' / 'analysis.log')
+    extents = {}
+    for index, (_, text) in enumerate(listing):
+        call = re.match(r'call\s+([0-9a-f]+) <', text)
+        if not call:
+            continue
+        spans = []
+        for _, before in reversed(listing[max(0, index - 32):index]):
+            mnemonic = before.split()[0] if before else ''
+            # The block is relative to rsp at the call; any rsp change or control transfer ends it.
+            if mnemonic.startswith(('call', 'j', 'ret', 'push', 'pop', 'rep')) or re.search(r',%rsp$', before):
+                break
+            store = re.match(r'(\w+)\s+(%\w+|\$\w+),(?:0x([0-9a-f]+))?\(%rsp\)$', before)
+            if not store:
+                continue
+            width = STORE_WIDTH.get(store[1])
+            if store[1] == 'mov':
+                width = next((w for pattern, w in REGISTER_WIDTH if pattern.match(store[2])), None)
+            if width:
+                spans.append((int(store[3] or '0', 16), width))
+        extent = 0
+        for offset, width in sorted(spans):
+            if offset > extent:
+                break
+            extent = max(extent, offset + width)
+        target = int(call[1], 16)
+        extents[target] = min(extents.get(target, extent), extent)
+    return extents

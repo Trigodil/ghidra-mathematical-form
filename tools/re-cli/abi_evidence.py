@@ -334,6 +334,7 @@ def seed_manifests(base, rows, imports=()):
             log.write(json.dumps(dict(sorted(stats.items()))) + '\n')
 
     preserved = register_effects.kept(base, rows, imports)
+    extents = register_effects.outgoing_extents(base)
     result = {}
     for caller, targets in by_caller.items():
         lines = []
@@ -376,8 +377,10 @@ def seed_manifests(base, rows, imports=()):
                 fields[2] = f'b13_{width}@register:0:{width}'
             block = definition['stackargs']
             if block:
+                # A callee that passes the block's address on may touch all that its callers wrote.
+                size = max(block['size'], (extents.get(target, 0) + 7) & ~7)
                 fields.append('stack=' + ';'.join(
-                    [stack_struct_name(names[target]), f"{block['size']:x}"] +
+                    [stack_struct_name(names[target]), f"{size:x}"] +
                     [f"{f['offset']:x}.{f['size']}.{f['type_descriptor']}" for f in block['fields']]))
             if proven_noreturn(base, target):
                 fields.append('noreturn')
