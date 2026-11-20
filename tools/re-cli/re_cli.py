@@ -255,6 +255,7 @@ class Workflow:
                               HERE / 'full_recovery.py', HERE / 'recovery_build.py',
                               HERE / 'source_project.py',
                               HERE / 'global_state.py', HERE / 'abi_evidence.py',
+                              HERE / 'machine_types.py', HERE / 'elf_image.py',
                               HERE / 'code_blobs.py', HERE / 'register_effects.py',
                               Path('/usr/bin/objdump')]):
             fingerprint.update(str(source).encode())
@@ -374,8 +375,8 @@ class Workflow:
             quality = out / 'quality.tsv'
             if row['status'] == 'ok' and quality.is_file():
                 flags = dict(line.split('\t') for line in quality.read_text().splitlines())
-                row['unimplemented_instructions'] = flags.get('unimplemented') == '1'
-                row['bad_data'] = flags.get('bad_data') == '1'
+                row['unimplemented_instructions'] = flags.get('unimplemented') != '0'
+                row['bad_data'] = flags.get('bad_data') != '0'
                 row['unknown_relocation_read'] = flags.get('unknown_relocation_read') != '0'
                 if row['unimplemented_instructions'] or row['bad_data']:
                     row['status'] = 'partial'
