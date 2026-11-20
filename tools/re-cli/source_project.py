@@ -23,6 +23,11 @@ USEROPS = {
     # UD2 raises SIGILL; the userop never returns a target.
     'invalidInstructionException': 'static inline code *invalidInstructionException(void) { __builtin_trap(); }',
     **{name: f'extern void {name}(...);' for name in ('abort', 'exit', '__assert_fail', '__stack_chk_fail')},
+    # FLOAT_NAN; the decompiler prints the op as NAN(x).
+    'NAN': '#define NAN(x) __builtin_isnan(x)',
+    # A string store of exactly n bytes: the literal, then zeros (its bytes may hold a NUL).
+    'builtin_strncpy': ('#define builtin_strncpy(d, s, n) ({ char *d_ = (char *)(d); unsigned long n_ = (n); '
+                        '__builtin_memset(d_, 0, n_); __builtin_memcpy(d_, s, sizeof(s) < n_ ? sizeof(s) : n_); d_; })'),
 }
 # SSE userops on xunknown16 with their instruction semantics; operand 1 is the destination register.
 _LANES = ('static inline xunknown16 {name}(xunknown16 d, xunknown16 c) {{ uint16_t w[8]; uint64_t n = (uint64_t)c; '
@@ -369,6 +374,57 @@ def decayed_store(text, match, name):
     return f'{match[1]}{match[2]}{match[3]}({decl[1].strip()}){name};'
 
 
+SMALL_ARRAY_DECL = re.compile(VECTOR_ELEMENT + r'\s+([A-Za-z_]\w*)\s*\[\s*(2|4|8|16)\s*\]\s*;')
+SMALL_ARRAY_DEREF = re.compile(r'\*\s*\(\s*' + VECTOR_ELEMENT + r'\s*\(\s*\*\s*\)\s*\[\s*(2|4|8)\s*\]\s*\)')
+SMALL_ARRAY_CAST = re.compile(r'\(\s*' + VECTOR_ELEMENT + r'\s*\[\s*(2|4|8)\s*\]\s*\)')
+ASSIGNMENT = re.compile(r'(?m)^([ \t]*)(?!(?:if|while|for|return|else|case|do)\b)([^;{}=\n]+?)[ \t]*=(?!=)[ \t]*([^;{}]+);')
+
+
+def lower_small_array_copies(text):
+    """A 2, 4 or 8 byte array copied whole (a = (xunknown1 [8])w; *(xunknown1 (*) [8])p = a; w = a;)
+    is not C; copy its bytes. Remaining array casts of a value become the word type."""
+    masked = code_mask(text)
+    arrays = {m[1]: int(m[2]) for m in SMALL_ARRAY_DECL.finditer(masked)}
+
+    def array_lvalue(expr):
+        # Width and address of an array typed lvalue, or None.
+        expr = expr.strip()
+        if expr in arrays:
+            return arrays[expr], expr
+        m = SMALL_ARRAY_DEREF.match(expr)
+        if m and cast_operand_end(expr, m.end()) == len(expr):
+            return int(m[1]), f'(xunknown1 *){expr[m.end():].strip()}'
+        return None
+
+    edits = []
+    for m in ASSIGNMENT.finditer(masked):
+        left, right = text[m.start(2):m.end(2)], text[m.start(3):m.end(3)].strip()
+        dst, src = array_lvalue(left), array_lvalue(right)
+        # lower_vectors handles 16 byte arrays.
+        if dst and dst[0] == 16 or src and src[0] == 16:
+            continue
+        piece = re.search(r'\._\d+_(\d+)_\s*$', left)
+        if piece and src:
+            # A slice store keeps its own lowering; it gets the array's bytes, not its address.
+            if int(piece[1]) == src[0]:
+                edits.append((m.start(3), m.end(3), f'__recovery_read{src[0]}({src[1]}, 0)'))
+            continue
+        if dst:
+            cast = SMALL_ARRAY_CAST.match(right)
+            if src:
+                value = src[1]
+            elif cast and cast_operand_end(right, cast.end()) == len(right):
+                value = f'&(xunknown{dst[0]}){{{right[cast.end():].strip()}}}'
+            else:
+                value = f'&(xunknown{dst[0]}){{{right}}}'
+            edits.append((m.start(2), m.end(), f'__builtin_memcpy({dst[1]}, {value}, {dst[0]});'))
+        elif src:
+            edits.append((m.start(2), m.end(), f'__builtin_memcpy(&({left.strip()}), {src[1]}, {src[0]});'))
+    for start, end, value in reversed(edits):
+        text = text[:start] + value + text[end:]
+    return SMALL_ARRAY_CAST.sub(lambda m: f'(xunknown{m[1]})', text)
+
+
 def lower_vectors(text):
     """Lower the array type xunknown1 [16] to the word xunknown16 (unsigned __int128).
 
@@ -408,8 +464,10 @@ def lower_vectors(text):
 
     words = set(pointers)
     buffers = []
+    # An odd stack slot keeps its width: a wider word would overwrite the next slot of the frame.
+    odd_slot = lambda m: m[2] != '16' and re.search(r'Stack_[0-9a-f]+$', m[1])
     for match in re.finditer(VECTOR_ELEMENT + r'\s+([A-Za-z_]\w*)\s*\[\s*(3|5|6|7|9|1[0-6])\s*\]\s*;', masked):
-        if not decays(match[1], masked[:match.start()] + masked[match.end():]):
+        if not odd_slot(match) and not decays(match[1], masked[:match.start()] + masked[match.end():]):
             edits.append((match.start(), match.end(), f'{ctype(int(match[2]))} {match[1]};'))
             words.add(match[1])
         else:
@@ -425,16 +483,26 @@ def lower_vectors(text):
             part = part[:s - start] + value + part[e - start:]
         return part
 
+    buffer_names = {match[1] for match in buffers}
     for match in buffers:
         name = re.escape(match[1])
         zero = re.compile(r'\(\s*' + VECTOR_ELEMENT + r'\s*\[\s*(\d+)\s*\]\s*\)\s*0x0\s*')
-        copies = [(m.start(), m.end(), f'__builtin_memset({match[1]}, 0, {zero.fullmatch(m[1])[1]});' if zero.fullmatch(m[1])
-                   else '__builtin_memcpy({0}, &(__typeof__({1})){{{1}}}, sizeof({1}));'.format(
-                       match[1], lowered(m.start(1), m.end(1))))
+        # Buffer to buffer is a plain byte copy; the array cannot initialize a compound literal.
+        width = int(match[2]) if odd_slot(match) else None
+        bound = (lambda n: f'(sizeof({n}) < {width} ? sizeof({n}) : {width})') if width else (lambda n: f'sizeof({n})')
+        copies = [(m.start(), m.end(), f'__builtin_memset({match[1]}, 0, {width or zero.fullmatch(m[1])[1]});' if zero.fullmatch(m[1])
+                   else f'__builtin_memcpy({match[1]}, {m[1].strip()}, {bound(m[1].strip())});' if m[1].strip() in buffer_names
+                   else '__builtin_memcpy({0}, &(__typeof__({1})){{{1}}}, {2});'.format(
+                       match[1], lowered(m.start(1), m.end(1)), bound(lowered(m.start(1), m.end(1)))))
                   for m in re.finditer(rf'(?m)^[ \t]*{name}[ \t]*=(?!=)[ \t]*([^;{{}}]+);', masked)]
-        copies += [(m.start(), m.end(), f'__builtin_memcpy(&({m[1]}), {match[1]}, sizeof({m[1]}));')
-                   for m in re.finditer(rf'(?m)^[ \t]*([A-Za-z_]\w*)[ \t]*=[ \t]*{name};', masked)]
-        if copies:
+        copies += [(m.start(), m.end(), f'(__builtin_memset(&({m[1]}), 0, sizeof({m[1]})), '
+                    f'__builtin_memcpy(&({m[1]}), {match[1]}, {bound(m[1])}));' if width else
+                    f'__builtin_memcpy(&({m[1]}), {match[1]}, sizeof({m[1]}));')
+                   for m in re.finditer(rf'(?m)^[ \t]*([A-Za-z_]\w*)[ \t]*=[ \t]*{name};', masked)
+                   if m[1] not in buffer_names]
+        if copies and width:
+            edits.extend(copies)
+        elif copies:
             # The word is 16 bytes, so the buffer must hold one whole.
             edits.append((match.start(), match.end(), f'xunknown1 {match[1]} [16];'))
             edits.extend(copies)
@@ -484,12 +552,15 @@ def cast_operand_end(mask, start):
     while position < len(mask) and mask[position] in ' \t\n*&-!~':
         position += 1
     if position < len(mask) and mask[position] == '(':
-        depth = 0
+        depth, opening = 0, position
         while position < len(mask):
             depth += {'(': 1, ')': -1}.get(mask[position], 0)
             position += 1
             if depth == 0:
                 break
+        # A parenthesized pointer type is a cast; its operand follows.
+        if re.fullmatch(r'\(\s*[A-Za-z_][\w\s]*\*[\s*]*\)', mask[opening:position]):
+            return cast_operand_end(mask, position)
     else:
         match = re.compile(r'[A-Za-z_]\w*|0[xX][0-9a-fA-F]+|\d+').match(mask, position)
         if not match:
@@ -641,6 +712,9 @@ def lower_storage(text):
                 end = stop
             else:
                 replacement = f'__recovery_GET{width}({name}, {offset})'
+                # A called piece is a code pointer; the uint64_t word cannot be called.
+                if width == 8 and re.search(r'\(\s*\*$', before) and re.match(r'\)\s*\(', after):
+                    replacement = f'(code *){replacement}'
             used.add(width)
             pieces.extend([fragment[cursor:match.start()], replacement])
             cursor = end
@@ -940,7 +1014,16 @@ def lower_frame(text):
     declaration = '  struct {\n' + ''.join(f'    {m}\n' for m in members) + '  } __attribute__((' + ('packed, ' if packed else '') + 'aligned(16))) frame__;'
     # The frame as an asm operand lets a callee reach every member through any member address.
     declaration += '\n  __asm__ volatile("" : : "r"(&frame__) : "memory");'
-    edits = [(u.start(), u.end(), 'frame__.' + u[1]) for u in uses]
+    edits = []
+    for u in uses:
+        f = by_name[u[1]]
+        # A slice past its member reaches the next stack slots; it is a slice of the frame there.
+        call = re.search(r'__recovery_[GS]ET(\d+)\(\s*$', mask[:u.start()])
+        offset = re.match(r'\s*,\s*(\d+)\b', mask[u.end():]) if call else None
+        if offset and int(offset[1]) + int(call[1]) > f['size']:
+            edits.append((u.start(), u.end() + offset.end(), f'frame__, {f["position"] + int(offset[1])}'))
+        else:
+            edits.append((u.start(), u.end(), 'frame__.' + u[1]))
     first = min(f['span'][0] for f in fields)
     for f in fields:
         begin, end = f['span']
@@ -1084,7 +1167,7 @@ def assemble(binary_report):
     transformed, slice_widths, odd_widths, storage, frames = [], set(), set(), [], []
     for address, text in bodies:
         text = pin_stored_literals(text, base / 'functions' / f'{address:x}' / 'rip-references.tsv', image)
-        lowered, vectors = lower_vectors(replace_identifiers(text, renames))
+        lowered, vectors = lower_vectors(lower_small_array_copies(replace_identifiers(text, renames)))
         lowered, used, detail = lower_storage(lowered)
         lowered = lower_struct_casts(lowered)
         lowered, odd_used = lower_odd_widths(initialize_tls_base(lower_pointer_floats(lowered)))
