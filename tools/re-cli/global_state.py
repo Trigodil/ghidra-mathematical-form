@@ -127,7 +127,10 @@ def relocated_words(record, image):
     for offset in range(0, record["size"], 8):
         address = record["address"] + offset
         if address in patched and patched[address] is None:
-            return None
+            if address not in image.import_words:
+                return None
+            words.append((0, image.import_words[address]))
+            continue
         words.append((int.from_bytes(raw[offset:offset + 8], "little"), patched.get(address)))
     return words
 
@@ -277,7 +280,7 @@ def recover(base, rows, functions=None, source="", image=None):
                   if r.get("pointer_target") is not None and not r["pointer_target_is_code"]
                   and r.get("initial_status") != "known" and r["size"] == 8}
         for words in relocated_arrays.values():
-            wanted.update(t for _, t in words if t is not None and t not in functions)
+            wanted.update(t for _, t in words if isinstance(t, int) and t not in functions)
         # Literals the lowering pinned to their original address (pin_stored_literals).
         wanted.update(int(m, 16) for m in re.findall(r"\b__recovery_string_([0-9a-f]+)\b", source))
         for target in sorted(wanted):
@@ -511,6 +514,11 @@ def recover(base, rows, functions=None, source="", image=None):
         for index, (word, target) in enumerate(words):
             if target is None:
                 values.append(f"0x{word:x}UL")
+                continue
+            if isinstance(target, str):
+                # The import under its own link name; the C name may be declared otherwise.
+                array_declarations.append(f'extern char __recovery_import_{target}[] __asm__("{target}");')
+                values.append(f"(unsigned long)__recovery_import_{target}")
                 continue
             possible = [
                 other for other in address_objects

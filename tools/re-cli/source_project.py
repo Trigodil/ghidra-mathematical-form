@@ -939,7 +939,7 @@ def link_boundary(binary_path):
 
 
 def call_imports(text, imports):
-    """Name imports called via a GOT slot, (*pcRam...3fd0)(x), or a PLT stub, __recovered_1050(x)."""
+    """Name imports called via a GOT slot, (*pcRam...3fd0)(x), or a PLT stub, __recovered_1050(x), and GOT slot reads."""
     used = set()
 
     def rename(match):
@@ -950,6 +950,9 @@ def call_imports(text, imports):
         return name
 
     text = GOT_CALL.sub(rename, text)
+    # A GOT slot read as a value is the import's address.
+    text = re.sub(r'(?<![\w&])[a-z]{1,3}Ram([0-9a-fA-F]{16})\b',
+                  lambda m: f'((uint64_t)&{rename(m)})' if int(m[1], 16) in imports else m[0], text)
     return ADDRESS_CALL.sub(
         lambda m: rename(m) + '(' if int(m[1], 16) in imports else m[0], text), used
 

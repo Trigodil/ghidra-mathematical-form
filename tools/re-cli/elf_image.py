@@ -127,6 +127,7 @@ class Elf:
         if hasattr(self, "_relocated"):
             return self._relocated
         found = self._relocated = {}
+        self.import_words = {}
         for section in self.sections:
             if section["type"] != 4:
                 continue
@@ -137,8 +138,11 @@ class Elf:
                 if kind == 8:
                     found[where] = addend
                 elif kind in (1, 6) and index and symbols:
-                    _, _, _, shndx, value, _ = struct.unpack_from("<IBBHQQ", self.data,
-                                                                  symbols["offset"] + index * 24)
+                    name, _, _, shndx, value, _ = struct.unpack_from("<IBBHQQ", self.data,
+                                                                     symbols["offset"] + index * 24)
                     found[where] = value + addend if shndx else None
+                    if not shndx and kind == 1 and not addend:
+                        # An absolute word naming an import, such as a stored realloc pointer.
+                        self.import_words[where] = self.string(self.sections[symbols["link"]]["offset"], name)
         return found
 
