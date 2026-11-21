@@ -88,6 +88,29 @@ bool StackAffectingOps::affectsTest(PcodeOp *op,Varnode *vn) const
   return true;
 }
 
+/// A phi in \b untied taking a value not already in the aliased storage of \b tied would become
+/// a store there, seen by later reads through a pointer; \b true if such a merge must not happen
+static bool phiWritesNewValue(HighVariable *untied,HighVariable *tied)
+
+{
+  if (untied->isAddrTied() || !tied->isAddrTied() || tied->isPersist()) return false;
+  Varnode *tiedVn = tied->getTiedVarnode();
+  if (tiedVn->hasNoLocalAlias()) return false;
+  for(int4 i=0;i<untied->numInstances();++i) {
+    Varnode *vn = untied->getInstance(i);
+    if (!vn->isWritten() || vn->getDef()->code() != CPUI_MULTIEQUAL) continue;
+    PcodeOp *op = vn->getDef();
+    for(int4 j=0;j<op->numInput();++j) {
+      Varnode *in = op->getIn(j);
+      while(in->isWritten() && in->getDef()->code() == CPUI_COPY)
+	in = in->getDef()->getIn(0);
+      if (in->getAddr() != tiedVn->getAddr() || in->getSize() != tiedVn->getSize())
+	return true;
+    }
+  }
+  return false;
+}
+
 /// \brief Required tests to merge HighVariables that are not Cover related
 ///
 /// This is designed to short circuit merge tests, when we know properties of the
@@ -114,6 +137,9 @@ bool Merge::mergeTestRequired(HighVariable *high_out,HighVariable *high_in)
 	return false;		// with an address tied output of different address
     }
   }
+
+  if (phiWritesNewValue(high_out,high_in) || phiWritesNewValue(high_in,high_out))
+    return false;		// The merged phi would write the storage where the code only reads it
 
   if (high_in->isInput()) {
 				// Input and persist must be different vars
