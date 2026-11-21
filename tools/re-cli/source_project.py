@@ -631,6 +631,7 @@ def lower_storage(text):
     edits = []
     declarations = list(re.finditer(r'\b(?:xunknown1|undefined1)\s+([A-Za-z_]\w*)\s*\[\s*(2|4|8|16)\s*\]\s*;', masked))
     array_names = {match[1] for match in declarations}
+    array_widths = {match[1]: int(match[2]) for match in declarations}
     integer_arrays = set()
     for multiply in re.finditer(r'\b([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)\b', masked):
         if multiply[1] in array_names and multiply[2] in array_names:
@@ -717,6 +718,8 @@ def lower_storage(text):
                 array = re.fullmatch(r'\s*\*\((?:xunknown1|uint1|int1) \(\*\) ?\[(\d+)\]\)(\(.*\))\s*', value, re.S)
                 if array and int(array[1]) == width and cast_operand_end(array[2], 0) == len(array[2]):
                     value = f'__recovery_read{width}({array[2]}, 0)'
+                elif array_widths.get(value.strip()) == width and value.strip() not in integer_arrays:
+                    value = f'__recovery_read{width}({value.strip()}, 0)'
                 replacement = f'__recovery_SET{width}({name}, {offset}, ({value}))'
                 end = stop
             else:
