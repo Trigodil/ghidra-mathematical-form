@@ -162,6 +162,8 @@ class LoadGuard {
   }
 public:
   PcodeOp *getOp(void) const { return op; }	///< Get the PcodeOp being guarded
+  AddrSpace *getSpace(void) const { return spc; }	///< Get the stack space being guarded
+  uintb getPointerBase(void) const { return pointerBase; }	///< Get the base offset of the pointer
   uintb getMinimum(void) const { return minimumOffset; }	///< Get minimum offset of the guarded range
   uintb getMaximum(void) const { return maximumOffset; }	///< Get maximum offset of the guarded range
   int4 getStep(void) const { return step; }		///< Get the calculated step associated with the range (or 0)

@@ -2122,6 +2122,46 @@ int4 ActionReturnRecovery::apply(Funcdata &data)
   return 0;
 }
 
+/// Is any byte of [off,off+size) inside one of the given (first,last) ranges
+static bool overlapsRange(const vector<pair<uintb,uintb> > &ranges,uintb off,int4 size)
+
+{
+  for(int4 i=0;i<ranges.size();++i)
+    if (off <= ranges[i].second && ranges[i].first <= off + size - 1) return true;
+  return false;
+}
+
+/// Collect stack parameter blocks an indexed STORE starts in (a rep movs copy); they stay mapped,
+/// otherwise the call reads the values from before the loop
+static void gatherStoreFilledParams(Funcdata &data,vector<pair<uintb,uintb> > &kept)
+
+{
+  const list<LoadGuard> &guards(data.getStoreGuards());
+  if (guards.empty()) return;
+  for(int4 i=0;i<data.numCalls();++i) {
+    FuncCallSpecs *fc = data.getCallSpecs(i);
+    if (!fc->isInputLocked()) continue;
+    if (fc->getSpacebaseOffset() == FuncCallSpecs::offset_unknown) continue;
+    for(int4 j=0;j<fc->numParams();++j) {
+      ProtoParameter *param = fc->getParam(j);
+      if (!param->hasStorage()) continue;
+      Address addr = param->getAddress();
+      if (addr.getSpace()->getType() != IPTR_SPACEBASE) continue;
+      uintb off = addr.getSpace()->wrapOffset(fc->getSpacebaseOffset() + addr.getOffset());
+      uintb last = off + param->getSize() - 1;
+      list<LoadGuard>::const_iterator iter;
+      for(iter=guards.begin();iter!=guards.end();++iter) {
+	const LoadGuard &guard(*iter);
+	if (!guard.isValid(CPUI_STORE) || guard.getSpace() != addr.getSpace()) continue;
+	if (guard.getPointerBase() >= off && guard.getPointerBase() <= last) {
+	  kept.push_back(pair<uintb,uintb>(off,last));
+	  break;
+	}
+      }
+    }
+  }
+}
+
 int4 ActionRestrictLocal::apply(Funcdata &data)
 
 {
@@ -2131,6 +2171,8 @@ int4 ActionRestrictLocal::apply(Funcdata &data)
   Varnode *vn;
   int4 i;
   vector<EffectRecord>::const_iterator eiter,endeiter;
+  vector<pair<uintb,uintb> > kept;
+  gatherStoreFilledParams(data,kept);
 
   for(i=0;i<data.numCalls();++i) {
     fc = data.getCallSpecs(i);
@@ -2146,6 +2188,7 @@ int4 ActionRestrictLocal::apply(Funcdata &data)
       spacetype tp = addr.getSpace()->getType();
       if (tp == IPTR_SPACEBASE) {
 	uintb off = addr.getSpace()->wrapOffset(fc->getSpacebaseOffset() + addr.getOffset());
+	if (overlapsRange(kept,off,param->getSize())) continue;
 	data.getScopeLocal()->markNotMapped(addr.getSpace(),off,param->getSize(),true);
       }
       else if (tp == IPTR_JOIN) {
