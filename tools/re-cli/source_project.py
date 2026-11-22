@@ -1113,6 +1113,29 @@ def call_imports(text, imports):
         lambda m: rename(m) + '(' if int(m[1], 16) in imports else m[0], text), used
 
 
+def lower_float_imports(text):
+    """A double-returning import stored into an integer local keeps its bits; C would convert the value."""
+    names = '|'.join(IMPORT_RETURNS['double'].split())
+    word = r'(?:u?int|xunknown|undefined)8|u?int64_t|unsigned long|long'
+    out, last = [], 0
+    for m in re.finditer(rf'^(\s*)(\w+) = ((?:{names})\()', text, flags=re.M):
+        if m.start() < last:
+            continue
+        decl = re.search(rf'^\s*({word}) {m[2]};', text, flags=re.M)
+        if not decl:
+            continue
+        depth, i = 1, m.end()
+        while i < len(text) and depth:
+            depth += (text[i] == '(') - (text[i] == ')')
+            i += 1
+        if depth or text[i:i+1] != ';':
+            continue
+        t = decl[1] if re.fullmatch(r'(?:u?int|xunknown|undefined)8', decl[1]) else 'uint8'
+        out += [text[last:m.start(3)], f'BITCAST_{t}(', text[m.start(3):i], ')']
+        last = i
+    return ''.join(out) + text[last:]
+
+
 def lower_pointer_floats(text):
     """Store a pointer into a float-typed slot bitwise; a C cast would convert, or not compile."""
     def store(match):
@@ -1187,7 +1210,7 @@ def assemble(binary_report):
         lowered, vectors = lower_vectors(lower_small_array_copies(replace_identifiers(text, renames)))
         lowered, used, detail = lower_storage(lowered)
         lowered = lower_struct_casts(lowered)
-        lowered, odd_used = lower_odd_widths(initialize_tls_base(lower_pointer_floats(lowered)))
+        lowered, odd_used = lower_odd_widths(initialize_tls_base(lower_pointer_floats(lower_float_imports(lowered))))
         lowered, frame = lower_frame(lowered)
         if frame:
             frames.append(dict(address=address, **frame))
