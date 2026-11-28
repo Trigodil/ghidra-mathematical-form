@@ -17,10 +17,11 @@ import time
 import full_recovery
 import source_project
 import abi_evidence
+import application
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_REPO = HERE / 'backend' if (HERE / 'backend').is_dir() else HERE.parents[1]
-VERSION = '0.2.0'
+VERSION = '0.3.0'
 CHILDREN = set()
 CHILD_LOCK = threading.Lock()
 STOP = threading.Event()
@@ -253,7 +254,7 @@ class Workflow:
         fingerprint = hashlib.sha256()
         for source in sorted([*sources, *self.tools.values(), HERE / 're_cli.py', HERE / 'inventory.py',
                               HERE / 'full_recovery.py', HERE / 'recovery_build.py',
-                              HERE / 'source_project.py',
+                              HERE / 'source_project.py', HERE / 'application.py',
                               HERE / 'global_state.py', HERE / 'abi_evidence.py',
                               HERE / 'machine_types.py', HERE / 'elf_image.py',
                               HERE / 'code_blobs.py', HERE / 'register_effects.py',
@@ -496,14 +497,14 @@ class Workflow:
                            'Executable-section assembly is linear disassembly, not recovered source or flow coverage.',
                            'Pseudocode is heuristic; original source and equivalence are not established.',
                            'External dependencies and files behind symlinks are outside this scan.',
-                           'PE, Mach-O, non-x86-64 and archive contents are not supported.']
+                           'Native analysis supports x86-64 ELF; application archive recovery is reported separately.']
         save(folder / 'report.json', result)
         return result
 
     def recover_source(self, source, result, target):
         if digest(source) != result['sha256']:
             raise ValueError('Target changed since analysis; refusing stale recovery input')
-        key = source.name if target.is_file() else source.relative_to(target).as_posix()
+        key = application.source_key(source, target, self.output)
         spec = self.recovery_specs.get(key)
         missing = []
         if spec is None:
@@ -853,6 +854,10 @@ def print_summary(report, elapsed):
          f'Skipped files/directories: {len(report["skipped"])} | Elapsed: {elapsed:.2f}s')
     emit('Function totals cover named and discovered entry candidates; other code may remain undiscovered.')
     emit(f'Whole binaries rebuilt exactly: {sum(bool(b.get("whole_binary_recovered")) for b in binaries)}/{len(binaries)}')
+    if 'application' in report:
+        app = report['application']
+        emit(f'Application files: {len(app["files"])} recovered | Archives: {len(app["archives"])} | '
+             f'Discovery rounds: {len(app["iterations"])} | Unresolved extraction issues: {len(app["issues"])}')
     emit('Full source recovery requires a complete project rebuild matching every target byte; pseudocode counts do not establish recovery.')
 
 
@@ -865,7 +870,8 @@ def main(argv=None):
                'Exit codes: 0 supported work completed; 1 error; 2 partial/unsupported results; 130 interrupted.\n'
                'This launches static analysis, not the application. Requires Linux and the prepared native backend.',
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('folder', nargs='+', help='Application folder (or single ELF binary)')
+    parser.add_argument('folder', nargs='+', help='Executable or application folder; packaged app roots are detected automatically')
+    parser.add_argument('--single-binary', action='store_true', help='Recover only the supplied ELF, without expanding its application')
     parser.add_argument('--repo', type=Path, default=Path(os.environ.get('RE_REPO', DEFAULT_REPO)))
     parser.add_argument('-o', '--output', type=Path, help='Results directory outside the checkout')
     parser.add_argument('-j', '--jobs', type=int, default=2)
@@ -891,9 +897,10 @@ def main(argv=None):
             or not math.isfinite(args.stage_timeout) or args.stage_timeout <= 0):
         parser.error('Jobs/CPU/timeouts must be positive and memory must be at least 128 MiB')
     target = Path(' '.join(args.folder)).expanduser().absolute()
-    if not target.exists() or target.is_symlink():
-        parser.error('Application path must exist and must not itself be a symlink')
-    target = target.resolve()
+    if not target.exists():
+        parser.error('Application path must exist')
+    entry = target.resolve()
+    target = entry if args.single_binary else application.application_root(entry)
     if not target.is_file() and not target.is_dir():
         parser.error('Application path must be a regular file or directory')
     if args.output is None:
@@ -914,15 +921,25 @@ def main(argv=None):
                 raise ValueError('Another re- process is already writing to this output')
             workflow.prepare()
             paths, skipped = scan(target, workflow.output)
-            keys = {p.name if target.is_file() else p.relative_to(target).as_posix() for p in paths}
+            app_recovery = application.Recovery(workflow.output)
+            additional, application_report = app_recovery.recover(target, paths)
+            paths.extend(additional)
+            save(workflow.output / 'application' / 'manifest.json', application_report)
+            emit(f'[application] {entry}; root: {target}; {len(paths)} ELF files; '
+                 f'{len(application_report["archives"])} archives; '
+                 f'{len(application_report["files"])} recovered files')
+            keys = {application.source_key(p, target, workflow.output) for p in paths}
             if set(workflow.recovery_specs) - keys:
                 raise ValueError('Recovery specification contains targets not present in this scan')
-            report = dict(input=str(target), version=VERSION, binaries=[], skipped=skipped,
+            report = dict(input=str(target), entry=str(entry), version=VERSION, binaries=[], skipped=skipped,
+                          application=application_report,
                           target_executed=False, whole_application_recovered=False, status='running')
             save(workflow.output / 'report.json', report)
             emit(f'[scan] {len(paths)} ELF files; {len(skipped)} skipped; results: {workflow.output}')
             for item in skipped:
                 emit(f'[skipped] {item["path"]}: {item["reason"]}')
+            for item in application_report['issues']:
+                emit(f'[application issue] {item["path"]}: {item["reason"]}')
             for source in paths:
                 try:
                     result = workflow.import_analysis(source) if args.reuse_analysis else workflow.analyze(source)
@@ -940,7 +957,7 @@ def main(argv=None):
             # A directory may also require resources, scripts and dependency sources.
             # Matching its scanned ELFs alone must never certify that application.
             report['whole_application_recovered'] = target.is_file() and report['whole_binary_set_recovered']
-            report['recovery_scope'] = 'single ELF artifact' if target.is_file() else 'scanned ELF artifacts; application resources and external dependency sources unresolved'
+            report['recovery_scope'] = 'single ELF artifact' if target.is_file() else 'application ELF artifacts and recovered resources; external dependencies and application behavior unresolved'
             if not report['whole_application_recovered']:
                 report['status'] = 'partial'
             save(workflow.output / 'report.json', report)

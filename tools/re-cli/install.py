@@ -68,6 +68,7 @@ def install(prefix, repo):
 
     for name in (
         "re_cli.py",
+        "application.py",
         "inventory.py",
         "full_recovery.py",
         "recovery_build.py",
